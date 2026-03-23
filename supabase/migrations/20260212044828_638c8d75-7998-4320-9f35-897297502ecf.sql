@@ -1,0 +1,1 @@
+ALTER TABLE public.clients ADD COLUMN is_personal boolean NOT NULL DEFAULT false;
