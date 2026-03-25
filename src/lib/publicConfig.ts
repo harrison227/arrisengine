@@ -1,7 +1,7 @@
 import { supabase } from "@/integrations/supabase/client";
 
 interface PublicConfig {
-  publicSiteUrl: string;
+    publicSiteUrl: string;
 }
 
 let cachedConfig: PublicConfig | null = null;
@@ -9,88 +9,100 @@ let fetchPromise: Promise<PublicConfig | null> | null = null;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// If the build-time env var is set, skip the edge function entirely.
+const BUILD_TIME_URL = import.meta.env.VITE_PUBLIC_SITE_URL as string | undefined;
+
 async function invokePublicConfigOnce() {
-  return supabase.functions.invoke("public-config");
+    return supabase.functions.invoke("public-config");
 }
 
 async function invokePublicConfigWithRetry(): Promise<
-  Awaited<ReturnType<typeof invokePublicConfigOnce>>
-> {
-  const first = await invokePublicConfigOnce();
-  if (!first.error) return first;
+    Awaited<ReturnType<typeof invokePublicConfigOnce>>
+  > {
+    const first = await invokePublicConfigOnce();
+    if (!first.error) return first;
 
   // One quick retry handles transient CORS/proxy hiccups.
   await sleep(1500);
-  return invokePublicConfigOnce();
+    return invokePublicConfigOnce();
 }
 
 /**
  * Fetches public config from the backend and caches it.
  * Returns cached value if available.
+ * Skips the edge function call if VITE_PUBLIC_SITE_URL is set at build time.
  */
 export async function fetchPublicConfig(): Promise<PublicConfig | null> {
+    // If build-time URL is available, use it directly — no edge function needed.
+  if (BUILD_TIME_URL) {
+        cachedConfig = { publicSiteUrl: BUILD_TIME_URL };
+        return cachedConfig;
+  }
+
   // Return cached value if available
   if (cachedConfig) {
-    return cachedConfig;
+        return cachedConfig;
   }
 
   // If a fetch is already in progress, wait for it
   if (fetchPromise) {
-    return fetchPromise;
+        return fetchPromise;
   }
 
   // Try localStorage first for faster initial load
   const stored = localStorage.getItem("publicConfig");
-  if (stored) {
-    try {
-      cachedConfig = JSON.parse(stored);
-      // Still fetch in background to refresh
-      refreshConfigInBackground();
-      return cachedConfig;
-    } catch {
-      localStorage.removeItem("publicConfig");
+    if (stored) {
+          try {
+                  cachedConfig = JSON.parse(stored);
+                  // Still fetch in background to refresh
+            refreshConfigInBackground();
+                  return cachedConfig;
+          } catch {
+                  localStorage.removeItem("publicConfig");
+          }
     }
-  }
 
   // Fetch from backend
   fetchPromise = (async () => {
-    try {
-      const { data, error } = await invokePublicConfigWithRetry();
+        try {
+                const { data, error } = await invokePublicConfigWithRetry();
 
-      if (error) {
-        console.error("Failed to fetch public config:", error);
-        return null;
-      }
+          if (error) {
+                    console.error("Failed to fetch public config:", error);
+                    return null;
+          }
 
-      if (data?.publicSiteUrl) {
-        cachedConfig = data as PublicConfig;
-        localStorage.setItem("publicConfig", JSON.stringify(cachedConfig));
-        return cachedConfig;
-      }
+          if (data?.publicSiteUrl) {
+                    cachedConfig = data as PublicConfig;
+                    localStorage.setItem("publicConfig", JSON.stringify(cachedConfig));
+                    return cachedConfig;
+          }
 
-      return null;
-    } catch (err) {
-      console.error("Error fetching public config:", err);
-      return null;
-    } finally {
-      fetchPromise = null;
-    }
+          return null;
+        } catch (err) {
+                console.error("Error fetching public config:", err);
+                return null;
+        } finally {
+                fetchPromise = null;
+        }
   })();
 
   return fetchPromise;
 }
 
 function refreshConfigInBackground() {
+    if (BUILD_TIME_URL) return; // No need to refresh if build-time URL is set.
+
   invokePublicConfigWithRetry()
-    .then(({ data, error }) => {
-      if (!error && data?.publicSiteUrl) {
-        cachedConfig = data as PublicConfig;
-        localStorage.setItem("publicConfig", JSON.stringify(cachedConfig));
-      }
-    })
-    .catch(() => {
-      // Silent fail for background refresh
-    });
+      .then(({ data, error }) => {
+              if (!error && data?.publicSiteUrl) {
+                        cachedConfig = data as PublicConfig;
+                        localStorage.setItem("publicConfig", JSON.stringify(cachedConfig));
+              }
+      })
+      .catch(() => {
+              // Silent fail for background refresh
+      });
 }
 
 /**
@@ -98,23 +110,25 @@ function refreshConfigInBackground() {
  * Returns undefined if not yet cached.
  */
 export function getCachedPublicSiteUrl(): string | undefined {
+    if (BUILD_TIME_URL) return BUILD_TIME_URL;
+
   if (cachedConfig?.publicSiteUrl) {
-    return cachedConfig.publicSiteUrl;
+        return cachedConfig.publicSiteUrl;
   }
 
   // Try localStorage
   const stored = localStorage.getItem("publicConfig");
-  if (stored) {
-    try {
-      const config = JSON.parse(stored);
-      if (config?.publicSiteUrl) {
-        cachedConfig = config;
-        return config.publicSiteUrl;
-      }
-    } catch {
-      // Ignore parse errors
+    if (stored) {
+          try {
+                  const config = JSON.parse(stored);
+                  if (config?.publicSiteUrl) {
+                            cachedConfig = config;
+                            return config.publicSiteUrl;
+                  }
+          } catch {
+                  // Ignore parse errors
+          }
     }
-  }
 
   return undefined;
 }
@@ -123,5 +137,5 @@ export function getCachedPublicSiteUrl(): string | undefined {
  * Initialize config fetch on app startup
  */
 export function initPublicConfig(): void {
-  fetchPublicConfig();
+    fetchPublicConfig();
 }
