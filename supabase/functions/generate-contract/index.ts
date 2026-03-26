@@ -101,9 +101,9 @@ serve(async (req) => {
 
     if (isRevision) {
       // For revisions, use AI to modify the existing contract based on feedback
-      const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-      if (!LOVABLE_API_KEY) {
-        throw new Error('LOVABLE_API_KEY is not configured');
+      const GOOGLE_AI_API_KEY = Deno.env.get('GOOGLE_AI_API_KEY');
+      if (!GOOGLE_AI_API_KEY) {
+        throw new Error('GOOGLE_AI_API_KEY is not configured');
       }
 
       const systemPrompt = `You are a professional contract editor. Your job is to revise an existing contract based on feedback while maintaining the professional structure and legal language.
@@ -127,14 +127,14 @@ Return only the revised contract content with no markdown formatting.`;
 
       console.log('Revising contract for client:', clientName);
 
-      const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+          'Authorization': `Bearer ${GOOGLE_AI_API_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'google/gemini-2.5-flash',
+          model: 'gemini-2.5-flash',
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -188,8 +188,8 @@ Return only the revised contract content with no markdown formatting.`;
 
     // If custom scope of work is provided, use AI to enhance Section 2
     if (scopeOfWork && scopeOfWork.trim()) {
-      const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
-      if (LOVABLE_API_KEY) {
+      const GOOGLE_AI_API_KEY = Deno.env.get('GOOGLE_AI_API_KEY');
+      if (GOOGLE_AI_API_KEY) {
         const systemPrompt = `You are a professional contract writer. You need to update ONLY section 2 (SCOPE OF SERVICES) of a contract based on the custom scope provided.
 
 CRITICAL RULES:
@@ -208,14 +208,14 @@ ${deliverables ? `Deliverables to include: ${deliverables}` : ''}
 Return ONLY the Section 2 content, starting with "2. SCOPE OF SERVICES"`;
 
         try {
-          const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+          const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${LOVABLE_API_KEY}`,
+              'Authorization': `Bearer ${GOOGLE_AI_API_KEY}`,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-              model: 'google/gemini-2.5-flash',
+              model: 'gemini-2.5-flash',
               messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt }

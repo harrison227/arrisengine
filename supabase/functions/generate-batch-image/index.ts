@@ -78,13 +78,13 @@ serve(async (req) => {
     
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const lovableApiKey = Deno.env.get('LOVABLE_API_KEY');
+    const lovableApiKey = Deno.env.get('GOOGLE_AI_API_KEY');
     const openaiApiKey = Deno.env.get('OPENAI_API_KEY');
     const ideogramApiKey = Deno.env.get('IDEOGRAM_API_KEY');
     const googleApiKey = Deno.env.get('GOOGLE_AI_API_KEY');
 
     if (!lovableApiKey) {
-      throw new Error('LOVABLE_API_KEY is not configured');
+      throw new Error('GOOGLE_AI_API_KEY is not configured');
     }
 
     // Validate API keys for specific models
@@ -597,14 +597,14 @@ OUTPUT: 4:5 portrait (1080x1350), ultra-sharp, magazine-quality, brand colors mu
           await new Promise(r => setTimeout(r, waitMs));
         }
 
-        const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+        const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${lovableApiKey}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            model: 'google/gemini-3-pro-image-preview',
+            model: 'gemini-2.0-flash-exp',
             messages,
             modalities: ['image', 'text']
           }),

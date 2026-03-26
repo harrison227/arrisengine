@@ -36,13 +36,13 @@ serve(async (req) => {
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const lovableApiKey = Deno.env.get('LOVABLE_API_KEY');
+    const lovableApiKey = Deno.env.get('GOOGLE_AI_API_KEY');
     const openaiApiKey = Deno.env.get('OPENAI_API_KEY');
     const ideogramApiKey = Deno.env.get('IDEOGRAM_API_KEY');
     const googleApiKey = Deno.env.get('GOOGLE_AI_API_KEY');
 
     if (!lovableApiKey) {
-      throw new Error('LOVABLE_API_KEY is not configured');
+      throw new Error('GOOGLE_AI_API_KEY is not configured');
     }
 
     // Validate API keys for specific models
@@ -424,8 +424,8 @@ IMPORTANT: Analyze and mimic the visual style from the reference images provided
     } else {
       // Nano Banana / Nano Banana Pro via Lovable AI gateway
       const geminiModel = model === 'nano-banana-pro'
-        ? 'google/gemini-3-pro-image-preview'
-        : 'google/gemini-2.5-flash-image';
+        ? 'gemini-2.0-flash-exp'
+        : 'gemini-2.5-flash-image';
       
       console.log(`Calling ${model || 'nano-banana'} (${geminiModel}) for image generation...`);
       console.log('Prompt:', imagePrompt);
@@ -450,7 +450,7 @@ IMPORTANT: Analyze and mimic the visual style from the reference images provided
         messages.push({ role: 'user', content: imagePrompt });
       }
 
-      const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
+      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${lovableApiKey}`,
