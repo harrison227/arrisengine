@@ -427,7 +427,7 @@ IMPORTANT: Analyze and mimic the visual style from the reference images provided
         throw new Error('GOOGLE_AI_API_KEY is not configured');
       }
 
-      const geminiModel = 'gemini-2.0-flash-exp';
+      const geminiModel = 'gemini-3.1-flash-image-preview';
       console.log(`Calling ${model || 'nano-banana'} (${geminiModel}) via Google native API...`);
       console.log('Prompt:', imagePrompt);
       console.log('Reference images count:', allReferenceImages.length);

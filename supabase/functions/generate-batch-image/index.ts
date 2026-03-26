@@ -558,7 +558,7 @@ OUTPUT: 4:5 portrait (1080x1350), ultra-sharp, magazine-quality, brand colors mu
         throw new Error('GOOGLE_AI_API_KEY is not configured');
       }
 
-      const geminiModel = 'gemini-2.0-flash-exp';
+      const geminiModel = 'gemini-3.1-flash-image-preview';
       console.log(`Calling ${selectedModel || 'nano-banana'} (${geminiModel}) via Google native API...`);
       console.log('Reference images count:', allReferenceImages.length);
 
