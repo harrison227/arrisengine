@@ -422,44 +422,56 @@ IMPORTANT: Analyze and mimic the visual style from the reference images provided
       }
 
     } else {
-      // Nano Banana / Nano Banana Pro via Lovable AI gateway
-      const geminiModel = model === 'nano-banana-pro'
-        ? 'gemini-2.0-flash-exp'
-        : 'gemini-2.5-flash-image';
-      
-      console.log(`Calling ${model || 'nano-banana'} (${geminiModel}) for image generation...`);
-      console.log('Prompt:', imagePrompt);
-
-      // Build messages array
-      const messages: any[] = [];
-      
-      if (allReferenceImages.length > 0) {
-        const content: any[] = [
-          { type: 'text', text: imagePrompt }
-        ];
-        
-        for (const refImage of allReferenceImages) {
-          content.push({
-            type: 'image_url',
-            image_url: { url: refImage }
-          });
-        }
-        
-        messages.push({ role: 'user', content });
-      } else {
-        messages.push({ role: 'user', content: imagePrompt });
+      // Nano Banana / Nano Banana Pro via Google native API
+      if (!googleApiKey) {
+        throw new Error('GOOGLE_AI_API_KEY is not configured');
       }
 
-      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+      const geminiModel = 'gemini-2.0-flash-exp';
+      console.log(`Calling ${model || 'nano-banana'} (${geminiModel}) via Google native API...`);
+      console.log('Prompt:', imagePrompt);
+      console.log('Reference images count:', allReferenceImages.length);
+
+      // Build parts array for Google native API
+      const nativeParts: any[] = [{ text: imagePrompt }];
+
+      // Add reference images as inline data
+      for (const refImage of allReferenceImages) {
+        try {
+          if (refImage.startsWith('data:')) {
+            const mimeMatch = refImage.match(/^data:(image\/\w+);base64,/);
+            const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+            const base64Data = refImage.split(',')[1];
+            nativeParts.push({ inlineData: { mimeType, data: base64Data } });
+          } else {
+            const imgResp = await fetch(refImage);
+            const imgBuffer = await imgResp.arrayBuffer();
+            const imgBytes = new Uint8Array(imgBuffer);
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < imgBytes.length; i += chunkSize) {
+              const chunk = imgBytes.subarray(i, i + chunkSize);
+              binary += String.fromCharCode(...chunk);
+            }
+            const b64 = btoa(binary);
+            const contentType = imgResp.headers.get('content-type') || 'image/png';
+            nativeParts.push({ inlineData: { mimeType: contentType, data: b64 } });
+          }
+          console.log('Added reference image to Google API request');
+        } catch (err) {
+          console.error('Failed to add reference image:', err);
+        }
+      }
+
+      const nativeGoogleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${googleApiKey}`;
+      const response = await fetch(nativeGoogleUrl, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${lovableApiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: geminiModel,
-          messages,
-          modalities: ['image', 'text'],
+          contents: [{ parts: nativeParts }],
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+          },
         }),
       });
 
@@ -470,23 +482,27 @@ IMPORTANT: Analyze and mimic the visual style from the reference images provided
             { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
-        if (response.status === 402) {
-          return new Response(
-            JSON.stringify({ error: 'API credits exhausted. Please add funds to continue.' }),
-            { status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
         const errorText = await response.text();
-        console.error('AI API error:', response.status, errorText);
-        throw new Error('Failed to generate image');
+        console.error('Google API error:', response.status, errorText);
+        throw new Error(`Google API error: ${response.status}`);
       }
 
       const aiResponse = await response.json();
-      console.log('AI Response received');
+      console.log('Google native API Response received');
 
-      // Extract the generated image
-      generatedImage = aiResponse.choices?.[0]?.message?.images?.[0]?.image_url?.url;
-      textContent = aiResponse.choices?.[0]?.message?.content;
+      // Extract image from native API response
+      const candidates = aiResponse.candidates;
+      if (candidates?.[0]?.content?.parts) {
+        for (const part of candidates[0].content.parts) {
+          if (part.inlineData) {
+            generatedImage = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+            break;
+          }
+          if (part.text) {
+            textContent = part.text;
+          }
+        }
+      }
     }
 
     if (!generatedImage) {

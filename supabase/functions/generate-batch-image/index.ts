@@ -553,60 +553,87 @@ OUTPUT: 4:5 portrait (1080x1350), ultra-sharp, magazine-quality, brand colors mu
       }
 
     } else {
-      // Use Nano Banana Pro (default)
-      console.log('Calling Nano Banana for batch image generation...');
+      // Nano Banana / Nano Banana Pro via Google native API
+      if (!googleApiKey) {
+        throw new Error('GOOGLE_AI_API_KEY is not configured');
+      }
 
-      // Build the request content array
-      const contentArray: any[] = [
-        { type: 'text', text: prompt }
-      ];
+      const geminiModel = 'gemini-2.0-flash-exp';
+      console.log(`Calling ${selectedModel || 'nano-banana'} (${geminiModel}) via Google native API...`);
+      console.log('Reference images count:', allReferenceImages.length);
 
-      // Add brand logo as a reference image if provided
+      // Build parts array for Google native API
+      const nativeParts: any[] = [{ text: prompt }];
+
+      // Add brand logo
       if (brandLogoUrl) {
-        console.log('Including brand logo in generation:', brandLogoUrl);
-        contentArray.push({
-          type: 'image_url',
-          image_url: { url: brandLogoUrl }
-        });
-      }
-
-      // Add all style reference images
-      for (const refImage of allReferenceImages) {
-        contentArray.push({
-          type: 'image_url',
-          image_url: { url: refImage }
-        });
-      }
-
-      const messages: any[] = [
-        {
-          role: 'user',
-          content: contentArray.length > 1 ? contentArray : prompt
+        try {
+          const logoResp = await fetch(brandLogoUrl);
+          const logoBuffer = await logoResp.arrayBuffer();
+          const logoBytes = new Uint8Array(logoBuffer);
+          let binary = '';
+          const chunkSize = 8192;
+          for (let i = 0; i < logoBytes.length; i += chunkSize) {
+            const chunk = logoBytes.subarray(i, i + chunkSize);
+            binary += String.fromCharCode(...chunk);
+          }
+          const b64 = btoa(binary);
+          const contentType = logoResp.headers.get('content-type') || 'image/png';
+          nativeParts.push({ inlineData: { mimeType: contentType, data: b64 } });
+          console.log('Added brand logo to Google API request');
+        } catch (err) {
+          console.error('Failed to add brand logo:', err);
         }
-      ];
+      }
 
-      // Retry loop for rate limits (auto-queue behavior)
+      // Add reference images as inline data
+      for (const refImage of allReferenceImages) {
+        try {
+          if (refImage.startsWith('data:')) {
+            const mimeMatch = refImage.match(/^data:(image\/\w+);base64,/);
+            const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+            const base64Data = refImage.split(',')[1];
+            nativeParts.push({ inlineData: { mimeType, data: base64Data } });
+          } else {
+            const imgResp = await fetch(refImage);
+            const imgBuffer = await imgResp.arrayBuffer();
+            const imgBytes = new Uint8Array(imgBuffer);
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < imgBytes.length; i += chunkSize) {
+              const chunk = imgBytes.subarray(i, i + chunkSize);
+              binary += String.fromCharCode(...chunk);
+            }
+            const b64 = btoa(binary);
+            const contentType = imgResp.headers.get('content-type') || 'image/png';
+            nativeParts.push({ inlineData: { mimeType: contentType, data: b64 } });
+          }
+          console.log('Added reference image to Google API request');
+        } catch (err) {
+          console.error('Failed to add reference image:', err);
+        }
+      }
+
+      const nativeGoogleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${googleApiKey}`;
+
+      // Retry loop for rate limits
       const MAX_RETRIES = 5;
-      let aiResponse: any = null;
-      let lastError: string | null = null;
 
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         if (attempt > 0) {
-          const waitMs = Math.min(15000 * attempt, 60000); // 15s, 30s, 45s, 60s, 60s
+          const waitMs = Math.min(15000 * attempt, 60000);
           console.log(`Rate limited. Waiting ${waitMs / 1000}s before retry ${attempt}/${MAX_RETRIES}...`);
           await new Promise(r => setTimeout(r, waitMs));
         }
 
-        const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+        const response = await fetch(nativeGoogleUrl, {
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${lovableApiKey}`,
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: 'gemini-2.0-flash-exp',
-            messages,
-            modalities: ['image', 'text']
+            contents: [{ parts: nativeParts }],
+            generationConfig: {
+              responseModalities: ['TEXT', 'IMAGE'],
+            },
           }),
         });
 
@@ -623,66 +650,31 @@ OUTPUT: 4:5 portrait (1080x1350), ultra-sharp, magazine-quality, brand colors mu
           }
           continue;
         }
-        if (response.status === 402) {
-          return new Response(
-            JSON.stringify({ error: 'API credits exhausted. Please add funds.' }),
-            { status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
+
         if (!response.ok) {
-          throw new Error('Image generation failed');
+          const errorText = await response.text();
+          console.error('Google API error:', response.status, errorText);
+          throw new Error(`Google API error: ${response.status}`);
         }
 
-        try {
-          aiResponse = await response.json();
-        } catch (parseError) {
-          console.error('Failed to parse response on attempt', attempt, parseError);
-          if (attempt === MAX_RETRIES) {
-            if (batchItemId) {
-              await supabase.from('image_batch_items').update({ status: 'pending' }).eq('id', batchItemId);
+        const aiResponse = await response.json();
+        console.log('Google native API Response received');
+
+        // Extract image from native API response
+        const candidates = aiResponse.candidates;
+        if (candidates?.[0]?.content?.parts) {
+          for (const part of candidates[0].content.parts) {
+            if (part.inlineData) {
+              generatedImageUrl = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+              break;
             }
-            return new Response(
-              JSON.stringify({ error: 'Image generation response was incomplete. Please try again.' }),
-              { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-            );
           }
-          continue;
         }
 
-        // Check for embedded rate limit errors
-        const choiceError = aiResponse.choices?.[0]?.error;
-        if (choiceError) {
-          const isRateLimit = choiceError.code === 429 || choiceError.code === '429' ||
-            choiceError.message?.includes('RESOURCE_EXHAUSTED') ||
-            choiceError.metadata?.raw?.includes('RESOURCE_EXHAUSTED');
-
-          if (isRateLimit && attempt < MAX_RETRIES) {
-            console.log(`Embedded 429 on attempt ${attempt}, retrying...`);
-            continue;
-          }
-
-          console.error('Embedded error:', choiceError.message || JSON.stringify(choiceError).substring(0, 300));
-          if (batchItemId) {
-            await supabase.from('image_batch_items').update({ status: 'pending' }).eq('id', batchItemId);
-          }
-          return new Response(
-            JSON.stringify({ error: isRateLimit ? 'Image generation is busy. Please try again in a few minutes.' : 'Image generation failed. Try a different prompt or model.' }),
-            { status: isRateLimit ? 429 : 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
+        if (generatedImageUrl) break;
+        if (attempt === MAX_RETRIES) {
+          console.error('No image returned from Google API after retries');
         }
-
-        // Success - break out of retry loop
-        break;
-      }
-
-      console.log('Nano Banana response structure:', JSON.stringify(aiResponse).substring(0, 500));
-      
-      generatedImageUrl = aiResponse.choices?.[0]?.message?.images?.[0]?.image_url?.url;
-      
-      if (!generatedImageUrl) {
-        const textContent = aiResponse.choices?.[0]?.message?.content;
-        console.error('No image in Nano Banana response. Text content:', textContent || 'none');
-        console.error('Full response (truncated):', JSON.stringify(aiResponse).substring(0, 1000));
       }
     }
 
