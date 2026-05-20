@@ -23,7 +23,10 @@ export function isPublicHttpUrl(input: string): boolean {
   try {
     const url = new URL(input);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-    const host = url.hostname.toLowerCase();
+    // Deno (WHATWG-compliant) wraps IPv6 hostnames in brackets, e.g.
+    // `http://[::1]/`.hostname === '[::1]'. Strip them before pattern
+    // matching so `/^::1$/` and friends actually match.
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
     if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0') return false;
     if (PRIVATE_IP_PATTERNS.some((re) => re.test(host))) return false;
     if (BLOCKED_DOMAIN_FRAGMENTS.some((frag) => host.includes(frag))) return false;
