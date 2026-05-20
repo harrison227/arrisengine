@@ -115,15 +115,20 @@ Deno.serve(withErrorHandling({ fn: 'fetch-late-analytics' }, async ({ req, log }
     accounts = accounts.filter((a) => String(a.platform ?? a.provider ?? '').toLowerCase() === platform.toLowerCase());
   }
 
+  // ensureOptionalString returns string | undefined, but the helpers below
+  // (and the legacy emptyResponse shape) standardise on string | null.
+  const fromDateOrNull = fromDate ?? null;
+  const toDateOrNull = toDate ?? null;
+
   if (accounts.length === 0) {
     log.info('no_accounts_found');
-    return jsonResponse(emptyResponse(client, hasAnalyticsAccess, fromDate, toDate));
+    return jsonResponse(emptyResponse(client, hasAnalyticsAccess, fromDateOrNull, toDateOrNull));
   }
 
   const accountIds = accounts.map((a) => a.id).join(',');
 
   // Follower stats ----------------------------------------------------------
-  const { followerStats, analyticsNotEnabled: followerBlocked } = await fetchFollowerStats(late, client.late_profile_id, accountIds, fromDate, toDate, accounts, log);
+  const { followerStats, analyticsNotEnabled: followerBlocked } = await fetchFollowerStats(late, client.late_profile_id, accountIds, fromDateOrNull, toDateOrNull, accounts, log);
 
   // Post analytics ----------------------------------------------------------
   let postAnalytics: PostMetric[] = [];
