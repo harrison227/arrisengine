@@ -63,10 +63,11 @@ Deno.serve(withErrorHandling({ fn: 'public-brand-pack' }, async ({ req, log }) =
   };
 
   // Best-effort view tracking. Don't block the response on failure.
+  // Supabase query builders return PromiseLike, not Promise — so we pass
+  // both onfulfilled and onrejected to .then() instead of chaining .catch().
   supabase
     .rpc('record_brand_pack_view', { p_share_id: shareId })
-    .then(() => {})
-    .catch(() => {});
+    .then(() => {}, () => {});
 
   log.info('public_brand_pack_served', { shareId, clientId: shareLink.client_id });
 
