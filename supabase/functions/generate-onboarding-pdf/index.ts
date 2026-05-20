@@ -20,8 +20,8 @@ interface RequestBody { clientId: unknown; platforms: unknown; assetNeeds: unkno
 Deno.serve(withErrorHandling({ fn: 'generate-onboarding-pdf' }, async ({ req, log }) => {
   const body = await parseJsonBody<RequestBody>(req);
   const clientId = ensureUuid('clientId', body.clientId);
-  const platformsRaw = ensureRecord('platforms', body.platforms) as PlatformsInput;
-  const assetNeedsRaw = ensureRecord('assetNeeds', body.assetNeeds) as AssetNeedsInput;
+  const platformsRaw = ensureRecord('platforms', body.platforms) as unknown as PlatformsInput;
+  const assetNeedsRaw = ensureRecord('assetNeeds', body.assetNeeds) as unknown as AssetNeedsInput;
   const customNote = ensureOptionalString('customNote', body.customNote, 5_000) ?? '';
 
   await requireClientAccess(req, clientId);

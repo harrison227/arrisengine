@@ -123,7 +123,7 @@ Deno.serve(withErrorHandling({ fn: 'ai-text-posts' }, async ({ req, log }) => {
     } as AnthropicMessage;
   }, { max: 200 }) ?? [];
   const topPostsContext = ensureOptionalArray('topPostsContext', body.topPostsContext, (item, i) => {
-    const obj = ensureRecord(`topPostsContext[${i}]`, item) as TopPost;
+    const obj = ensureRecord(`topPostsContext[${i}]`, item) as unknown as TopPost;
     return obj;
   }, { max: 50 }) ?? [];
 
