@@ -110,7 +110,11 @@ Deno.serve(withErrorHandling({ fn: 'generate-contract' }, async ({ req, log }) =
       .select('business_name, contact_name, email, phone, website, industry, mrr')
       .eq('id', clientId)
       .maybeSingle();
-    if (data) clientInfo = data as typeof clientInfo;
+    if (data) {
+      // The select returns a wider shape than clientInfo's type — only
+      // business_name + mrr are read downstream, so a minimal cast is fine.
+      clientInfo = { business_name: (data as { business_name: string }).business_name, mrr: (data as { mrr: number | null }).mrr };
+    }
   }
 
   const isRevision = Boolean(revisionFeedback && existingContent);
