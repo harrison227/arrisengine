@@ -36,7 +36,7 @@ import { useAgencySettings } from '@/hooks/useAgencySettings';
 import { useContentPlans } from '@/hooks/useContentPlans';
 import { useKnowledgeEntries } from '@/hooks/useKnowledgeEntries';
 import { supabase } from '@/integrations/supabase/client';
-import jsPDF from 'jspdf';
+// jsPDF is dynamically imported inside handleDownloadPDF — keeps it out of the main bundle.
 import { cn } from '@/lib/utils';
 import { PlanFeedbackSection } from './PlanFeedbackSection';
 
@@ -466,6 +466,7 @@ export function SavedPlanDetail({ plan, clientName, onPlanUpdated }: SavedPlanDe
   };
 
   const handleDownloadPDF = async () => {
+    const { default: jsPDF } = await import('jspdf');
     const pdf = new jsPDF();
     const pageWidth = pdf.internal.pageSize.getWidth();
     const pageHeight = pdf.internal.pageSize.getHeight();
@@ -1231,7 +1232,7 @@ export function SavedPlanDetail({ plan, clientName, onPlanUpdated }: SavedPlanDe
                   </div>
 
                   {/* Script */}
-                  {(idea.script || true) && (
+                  {(
                     <Collapsible open={expandedScripts[index]} onOpenChange={() => toggleScript(index)}>
                       <CollapsibleTrigger asChild>
                         <Button variant="ghost" size="sm" className="w-full justify-between">
@@ -1401,7 +1402,7 @@ export function SavedPlanDetail({ plan, clientName, onPlanUpdated }: SavedPlanDe
                               </Button>
                             </div>
                           </div>
-                          {(idea.script || true) && (
+                          {(
                             <Collapsible open={expandedScripts[originalIndex]} onOpenChange={() => toggleScript(originalIndex)}>
                               <CollapsibleTrigger asChild>
                                 <Button variant="ghost" size="sm" className="w-full justify-between">

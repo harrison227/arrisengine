@@ -9,7 +9,7 @@ import { EditKnowledgeDialog } from '@/components/dialogs/EditKnowledgeDialog';
 import { ConfirmDeleteDialog } from '@/components/dialogs/ConfirmDeleteDialog';
 import { KnowledgeSummaryPanel } from '@/components/client-detail/KnowledgeSummaryPanel';
 import { Skeleton } from '@/components/ui/skeleton';
-import { generateKnowledgePdf } from '@/lib/knowledgePdf';
+// generateKnowledgePdf is dynamically imported on demand — keeps jspdf out of the main bundle.
 import { toast } from 'sonner';
 import {
   DropdownMenu,
@@ -72,6 +72,7 @@ export function KnowledgeBase({ clientId, clientName = 'Client' }: KnowledgeBase
     
     setIsGeneratingPdf(true);
     try {
+      const { generateKnowledgePdf } = await import('@/lib/knowledgePdf');
       await generateKnowledgePdf({
         clientName,
         agencyName: agencySettings?.agency_name || 'Agency',

@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import jsPDF from 'jspdf';
+// jsPDF is dynamically imported inside handleDownloadPDF — keeps it out of the main bundle.
 
 interface ContentIdea {
   hook: string;
@@ -165,9 +165,10 @@ export function DraftPreview({
     setIsAddingIdea(false);
   };
 
-  const handleDownloadPDF = () => {
+  const handleDownloadPDF = async () => {
     if (!draftPlan?.contentIdeas?.length) return;
 
+    const { default: jsPDF } = await import('jspdf');
     const pdf = new jsPDF();
     const pageWidth = pdf.internal.pageSize.getWidth();
     const pageHeight = pdf.internal.pageSize.getHeight();

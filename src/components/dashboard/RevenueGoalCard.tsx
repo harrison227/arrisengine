@@ -23,7 +23,7 @@ export function RevenueGoalCard() {
 
   // Calculate current MRR
   const currentMRR = clients
-    .filter(c => (c.status === 'active' || c.status === 'onboarding') && !(c as any).is_personal)
+    .filter(c => (c.status === 'active' || c.status === 'onboarding') && !(c as { is_personal?: boolean }).is_personal)
     .reduce((sum, c) => sum + c.mrr, 0);
 
   const progress = currentGoal 

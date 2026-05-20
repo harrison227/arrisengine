@@ -1,131 +1,28 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+/**
+ * Generate a single social-media caption via Anthropic.
+ *
+ * Contract preserved:
+ *   Request:  { concept, clientId?, refinement?, existingCaption?, videoTranscript? }
+ *   Response: { caption } | { error, ... }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { ensureNonEmptyString, ensureOptionalString, ensureOptionalUuid } from '../_shared/validation.ts';
+import { rateLimited } from '../_shared/errors.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireUser, requireClientAccess } from '../_shared/auth.ts';
+import { callAnthropic } from '../_shared/anthropic.ts';
+import { checkRateLimit } from '../_shared/rate-limit.ts';
 
-// Simple in-memory rate limiter (per-function instance)
-const rateLimitMap = new Map<string, number[]>();
-const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 30; // 30 requests per minute per client
-
-function checkRateLimit(clientId: string): { allowed: boolean; waitTime: number } {
-  const now = Date.now();
-  const timestamps = rateLimitMap.get(clientId) || [];
-  
-  // Remove timestamps outside the window
-  const validTimestamps = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-  
-  if (validTimestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    const oldestTimestamp = validTimestamps[0];
-    const waitTime = Math.ceil((oldestTimestamp + RATE_LIMIT_WINDOW_MS - now) / 1000);
-    return { allowed: false, waitTime };
-  }
-  
-  // Record this request
-  validTimestamps.push(now);
-  rateLimitMap.set(clientId, validTimestamps);
-  
-  return { allowed: true, waitTime: 0 };
+interface RequestBody {
+  concept: unknown;
+  clientId?: unknown;
+  refinement?: unknown;
+  existingCaption?: unknown;
+  videoTranscript?: unknown;
 }
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
-
-  try {
-    const { concept, clientId, refinement, existingCaption, videoTranscript } = await req.json();
-
-    if (!concept) {
-      return new Response(
-        JSON.stringify({ error: 'Concept is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Check rate limit
-    if (clientId) {
-      const rateLimitCheck = checkRateLimit(clientId);
-      if (!rateLimitCheck.allowed) {
-        console.log(`Rate limit exceeded for client ${clientId}. Wait ${rateLimitCheck.waitTime}s`);
-        return new Response(
-          JSON.stringify({ 
-            error: `Rate limit exceeded. Please wait ${rateLimitCheck.waitTime} seconds.`,
-            rateLimited: true,
-            waitTime: rateLimitCheck.waitTime
-          }),
-          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-
-    const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY');
-    if (!ANTHROPIC_API_KEY) {
-      throw new Error('ANTHROPIC_API_KEY is not configured');
-    }
-
-    // Get client info for context
-    let clientContext = '';
-    if (clientId) {
-      const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-      const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-      const supabase = createClient(supabaseUrl, supabaseKey);
-
-      const { data: client } = await supabase
-        .from('clients')
-        .select('business_name, industry')
-        .eq('id', clientId)
-        .single();
-
-      if (client) {
-        clientContext = `\nBrand: ${client.business_name}\nIndustry: ${client.industry}`;
-      }
-
-      // Get knowledge entries for better context - use all available categories
-      const { data: knowledge, error: knowledgeError } = await supabase
-        .from('knowledge_entries')
-        .select('title, content, category')
-        .eq('client_id', clientId)
-        .limit(10);
-
-      if (knowledgeError) {
-        console.error('Error loading knowledge entries:', knowledgeError);
-      }
-
-      if (knowledge && knowledge.length > 0) {
-        clientContext += '\n\nBrand Knowledge:';
-        knowledge.forEach(k => {
-          clientContext += `\n- [${k.category.toUpperCase()}] ${k.title}: ${k.content.substring(0, 500)}`;
-        });
-        console.log(`Loaded ${knowledge.length} knowledge entries for context`);
-      } else {
-        console.log('No knowledge entries found for client:', clientId);
-      }
-    }
-
-    // Build refinement instructions
-    let refinementInstructions = '';
-    if (refinement) {
-      refinementInstructions = `\n\nUSER GUIDANCE: ${refinement}`;
-    }
-    
-    let existingCaptionContext = '';
-    if (existingCaption) {
-      existingCaptionContext = `\n\nEXISTING CAPTION (use as reference or improve upon it): "${existingCaption}"`;
-    }
-
-    // Build video transcript context
-    let transcriptContext = '';
-    if (videoTranscript && videoTranscript.trim()) {
-      console.log(`Including video transcript (${videoTranscript.length} chars) in caption generation`);
-      transcriptContext = `\n\nVIDEO TRANSCRIPT (use this spoken content to inform the caption - reference key themes and messages):
-"${videoTranscript.substring(0, 1500)}"`;
-    }
-
-    const systemPrompt = `You are an expert social media copywriter who creates engaging, authentic captions for social media posts.
+const SYSTEM_PROMPT_BASE = `You are an expert social media copywriter who creates engaging, authentic captions for social media posts.
 
 CRITICAL RULES:
 - Your captions MUST align with the brand's voice, tone, and positioning provided below
@@ -138,10 +35,62 @@ Your captions should be:
 - Engaging with a hook at the start
 - Include a call-to-action when appropriate
 - NOT overly promotional or generic
-- Specific to this brand's messaging
-${clientContext}${refinementInstructions}`;
+- Specific to this brand's messaging`;
 
-    const userPrompt = `Write a social media caption for a post.
+Deno.serve(withErrorHandling({ fn: 'generate-caption' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const concept = ensureNonEmptyString('concept', body.concept, 5_000);
+  const clientId = ensureOptionalUuid('clientId', body.clientId);
+  const refinement = ensureOptionalString('refinement', body.refinement, 5_000);
+  const existingCaption = ensureOptionalString('existingCaption', body.existingCaption, 5_000);
+  const videoTranscript = ensureOptionalString('videoTranscript', body.videoTranscript, 50_000);
+
+  const supabase = getSupabaseAdmin();
+
+  // Auth gate. Without clientId we still require a logged-in user so this
+  // endpoint can't be hit anonymously to burn AI credits. With a clientId,
+  // verify the calling user actually has access to that client's data.
+  if (clientId) await requireClientAccess(req, clientId);
+  else await requireUser(req);
+
+  if (clientId) {
+    const rl = await checkRateLimit({ bucket: 'generate-caption', subject: clientId, windowSec: 60, max: 30, supabase });
+    if (!rl.allowed) throw rateLimited(`Rate limit exceeded. Please wait ${rl.waitTime} seconds.`, rl.waitTime);
+  }
+
+  // Build per-client context.
+  let clientContext = '';
+  if (clientId) {
+    const { data: client } = await supabase
+      .from('clients')
+      .select('business_name, industry')
+      .eq('id', clientId)
+      .maybeSingle();
+    if (client) clientContext = `\nBrand: ${client.business_name}\nIndustry: ${client.industry}`;
+
+    const { data: knowledge } = await supabase
+      .from('knowledge_entries')
+      .select('title, content, category')
+      .eq('client_id', clientId)
+      .limit(10);
+    if (knowledge && knowledge.length > 0) {
+      clientContext += '\n\nBrand Knowledge:';
+      for (const k of knowledge) {
+        clientContext += `\n- [${k.category.toUpperCase()}] ${k.title}: ${(k.content ?? '').substring(0, 500)}`;
+      }
+      log.info('knowledge_loaded', { entries: knowledge.length });
+    }
+  }
+
+  const refinementInstructions = refinement ? `\n\nUSER GUIDANCE: ${refinement}` : '';
+  const existingCaptionContext = existingCaption ? `\n\nEXISTING CAPTION (use as reference or improve upon it): "${existingCaption}"` : '';
+  const transcriptContext = videoTranscript?.trim()
+    ? `\n\nVIDEO TRANSCRIPT (use this spoken content to inform the caption - reference key themes and messages):\n"${videoTranscript.substring(0, 1500)}"`
+    : '';
+
+  const systemPrompt = `${SYSTEM_PROMPT_BASE}${clientContext}${refinementInstructions}`;
+
+  const userPrompt = `Write a social media caption for a post.
 
 Content concept: "${concept}"${existingCaptionContext}${transcriptContext}
 
@@ -159,70 +108,15 @@ ${refinement ? `Additional guidance: ${refinement}` : ''}
 
 Respond with ONLY the caption text - no titles, no hashtags, no JSON. Just the caption.`;
 
-    console.log('Generating caption with Claude Sonnet 4.5, refinement:', refinement || 'none');
+  const { text } = await callAnthropic({
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userPrompt }],
+    maxTokens: 1024,
+  });
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [
-          { role: 'user', content: userPrompt }
-        ],
-      }),
-    });
+  let caption = text.trim();
+  if (caption.startsWith('"') && caption.endsWith('"')) caption = caption.slice(1, -1);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Anthropic API error:', response.status, errorText);
-      
-      if (response.status === 429) {
-        return new Response(
-          JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }),
-          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      if (response.status === 529) {
-        return new Response(
-          JSON.stringify({ error: 'API is overloaded. Please try again shortly.' }),
-          { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      throw new Error(`Anthropic API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.content?.[0]?.text;
-
-    if (!content) {
-      throw new Error('No content returned from AI');
-    }
-
-    // Clean up the caption (remove quotes if wrapped)
-    let caption = content.trim();
-    if (caption.startsWith('"') && caption.endsWith('"')) {
-      caption = caption.slice(1, -1);
-    }
-
-    console.log('Generated caption for concept:', concept.substring(0, 50));
-
-    return new Response(
-      JSON.stringify({ caption }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-
-  } catch (error) {
-    console.error('Error in generate-caption:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    return new Response(
-      JSON.stringify({ error: errorMessage }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-});
+  log.info('caption_generated', { conceptLen: concept.length, captionLen: caption.length });
+  return jsonResponse({ caption });
+}));

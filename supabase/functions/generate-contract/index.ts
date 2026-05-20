@@ -1,112 +1,26 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+/**
+ * Generate or revise a contract document.
+ *
+ * Two flows:
+ *   - Revision (revisionFeedback + existingContent present): rewrites
+ *     the existing document via Gemini.
+ *   - New contract: pulls the default template, swaps placeholders, and
+ *     optionally runs Gemini to upgrade Section 2 (Scope of Services) when
+ *     a custom scope is supplied.
+ *
+ * Contract preserved:
+ *   Request:  { clientId?, ...form fields, revisionFeedback?, existingContent? }
+ *   Response: { content }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { notFound } from '../_shared/errors.ts';
+import { ensureOptionalString, ensureOptionalUuid, ensureOptionalEnum, ensureNumber } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireClientAccess, requireUser } from '../_shared/auth.ts';
+import { callGemini } from '../_shared/gemini.ts';
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
-
-  try {
-    const { 
-      clientId, 
-      contractType, 
-      scopeOfWork, 
-      startDate, 
-      endDate, 
-      paymentTerms, 
-      deliverables, 
-      revisionFeedback, 
-      existingContent,
-      agencyName,
-      agencyContactName,
-      agencyEmail,
-      agencyPhone,
-      clientContactName,
-      clientEmail,
-      clientPhone,
-      paymentAmount,
-      paymentCurrency,
-      billingInterval,
-      initialPaymentAmount,
-      governingJurisdiction,
-    } = await req.json();
-
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    // Get client info
-    let clientInfo = null;
-    if (clientId) {
-      const { data: client } = await supabase
-        .from('clients')
-        .select('business_name, contact_name, email, phone, website, industry, mrr')
-        .eq('id', clientId)
-        .single();
-
-      clientInfo = client;
-    }
-
-    // Get the default contract template
-    const { data: template, error: templateError } = await supabase
-      .from('contract_templates')
-      .select('content')
-      .eq('is_default', true)
-      .single();
-
-    if (templateError || !template) {
-      console.error('Error fetching template:', templateError);
-      throw new Error('No default contract template found');
-    }
-
-    const isRevision = !!revisionFeedback && !!existingContent;
-    const clientName = clientInfo?.business_name || 'Client';
-
-    // Format the payment amount
-    const formatPaymentAmount = () => {
-      const currency = paymentCurrency || 'USD';
-      const amount = paymentAmount || clientInfo?.mrr || 0;
-      
-      if (billingInterval && billingInterval !== 'one_time') {
-        const intervalMap: Record<string, string> = {
-          'monthly': 'month',
-          'quarterly': 'quarter',
-          'yearly': 'year',
-        };
-        const intervalLabel = intervalMap[billingInterval] || billingInterval;
-        
-        if (initialPaymentAmount && initialPaymentAmount !== amount) {
-          return `${initialPaymentAmount.toLocaleString()} ${currency} for the first ${intervalLabel}, then ${amount.toLocaleString()} ${currency} per ${intervalLabel}`;
-        }
-        return `${amount.toLocaleString()} ${currency} per ${intervalLabel}`;
-      }
-      return `${amount.toLocaleString()} ${currency}`;
-    };
-
-    // Format dates
-    const formatDate = (dateStr: string | null) => {
-      if (!dateStr) return 'To be specified';
-      try {
-        const date = new Date(dateStr);
-        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-      } catch {
-        return dateStr;
-      }
-    };
-
-    if (isRevision) {
-      // For revisions, use AI to modify the existing contract based on feedback
-      const GOOGLE_AI_API_KEY = Deno.env.get('GOOGLE_AI_API_KEY');
-      if (!GOOGLE_AI_API_KEY) {
-        throw new Error('GOOGLE_AI_API_KEY is not configured');
-      }
-
-      const systemPrompt = `You are a professional contract editor. Your job is to revise an existing contract based on feedback while maintaining the professional structure and legal language.
+const REVISION_SYSTEM = `You are a professional contract editor. Your job is to revise an existing contract based on feedback while maintaining the professional structure and legal language.
 
 CRITICAL RULES:
 1. Output PLAIN TEXT ONLY - absolutely NO markdown formatting
@@ -115,82 +29,7 @@ CRITICAL RULES:
 4. Only modify the sections specifically mentioned in the feedback
 5. Maintain all legal language and terms not mentioned in the feedback`;
 
-      const userPrompt = `Please revise this existing contract based on the feedback provided.
-
-EXISTING CONTRACT:
-${existingContent}
-
-REVISION FEEDBACK:
-${revisionFeedback}
-
-Return only the revised contract content with no markdown formatting.`;
-
-      console.log('Revising contract for client:', clientName);
-
-      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GOOGLE_AI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gemini-2.5-flash',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('AI gateway error:', response.status, errorText);
-        throw new Error(`AI gateway error: ${response.status}`);
-      }
-
-      const data = await response.json();
-      let content = data.choices?.[0]?.message?.content;
-
-      if (!content) {
-        throw new Error('No content returned from AI');
-      }
-
-      // Strip any remaining markdown
-      content = content
-        .replace(/\*\*/g, '')
-        .replace(/\*/g, '')
-        .replace(/^#+\s*/gm, '')
-        .replace(/`([^`]+)`/g, '$1')
-        .replace(/```[\s\S]*?```/g, '');
-
-      return new Response(
-        JSON.stringify({ content }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // For new contracts: Replace placeholders in the template
-    let content = template.content;
-
-    // Replace all placeholders
-    const replacements: Record<string, string> = {
-      '[EFFECTIVE DATE]': formatDate(startDate),
-      '[CLIENT]': clientName,
-      '[END DATE]': formatDate(endDate),
-      '[MONTHLY FEE]': formatPaymentAmount(),
-      '[GOVERNING JURISDICTION]': governingJurisdiction || 'California, USA',
-    };
-
-    for (const [placeholder, value] of Object.entries(replacements)) {
-      // Replace all occurrences (global replace)
-      content = content.split(placeholder).join(value);
-    }
-
-    // If custom scope of work is provided, use AI to enhance Section 2
-    if (scopeOfWork && scopeOfWork.trim()) {
-      const GOOGLE_AI_API_KEY = Deno.env.get('GOOGLE_AI_API_KEY');
-      if (GOOGLE_AI_API_KEY) {
-        const systemPrompt = `You are a professional contract writer. You need to update ONLY section 2 (SCOPE OF SERVICES) of a contract based on the custom scope provided.
+const SCOPE_REWRITE_SYSTEM = `You are a professional contract writer. You need to update ONLY section 2 (SCOPE OF SERVICES) of a contract based on the custom scope provided.
 
 CRITICAL RULES:
 1. Output ONLY the updated Section 2 content
@@ -199,73 +38,164 @@ CRITICAL RULES:
 4. Maintain professional legal language
 5. Keep the Change Requests clause (2.3) largely intact`;
 
-        const userPrompt = `Update Section 2 (SCOPE OF SERVICES) based on this custom scope:
+const BILLING_INTERVALS = ['monthly', 'quarterly', 'yearly', 'one_time'] as const;
+type BillingInterval = typeof BILLING_INTERVALS[number];
+
+interface RequestBody {
+  clientId?: unknown;
+  contractType?: unknown;
+  scopeOfWork?: unknown;
+  startDate?: unknown;
+  endDate?: unknown;
+  paymentTerms?: unknown;
+  deliverables?: unknown;
+  revisionFeedback?: unknown;
+  existingContent?: unknown;
+  agencyName?: unknown;
+  agencyContactName?: unknown;
+  agencyEmail?: unknown;
+  agencyPhone?: unknown;
+  clientContactName?: unknown;
+  clientEmail?: unknown;
+  clientPhone?: unknown;
+  paymentAmount?: unknown;
+  paymentCurrency?: unknown;
+  billingInterval?: unknown;
+  initialPaymentAmount?: unknown;
+  governingJurisdiction?: unknown;
+}
+
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/\*\*/g, '')
+    .replace(/\*/g, '')
+    .replace(/^#+\s*/gm, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/```[\s\S]*?```/g, '');
+}
+
+function formatDate(value?: string): string {
+  if (!value) return 'To be specified';
+  try {
+    return new Date(value).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  } catch {
+    return value;
+  }
+}
+
+Deno.serve(withErrorHandling({ fn: 'generate-contract' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const clientId = ensureOptionalUuid('clientId', body.clientId);
+  const scopeOfWork = ensureOptionalString('scopeOfWork', body.scopeOfWork, 50_000);
+  const startDate = ensureOptionalString('startDate', body.startDate, 50);
+  const endDate = ensureOptionalString('endDate', body.endDate, 50);
+  const deliverables = ensureOptionalString('deliverables', body.deliverables, 50_000);
+  const revisionFeedback = ensureOptionalString('revisionFeedback', body.revisionFeedback, 20_000);
+  const existingContent = ensureOptionalString('existingContent', body.existingContent, 200_000);
+  const paymentCurrency = ensureOptionalString('paymentCurrency', body.paymentCurrency, 10) ?? 'USD';
+  const billingInterval = ensureOptionalEnum<BillingInterval>('billingInterval', body.billingInterval, BILLING_INTERVALS);
+  const governingJurisdiction = ensureOptionalString('governingJurisdiction', body.governingJurisdiction, 200) ?? 'California, USA';
+  const paymentAmount = body.paymentAmount === undefined || body.paymentAmount === null ? undefined : ensureNumber('paymentAmount', body.paymentAmount, { min: 0 });
+  const initialPaymentAmount = body.initialPaymentAmount === undefined || body.initialPaymentAmount === null ? undefined : ensureNumber('initialPaymentAmount', body.initialPaymentAmount, { min: 0 });
+
+  if (clientId) await requireClientAccess(req, clientId);
+  else await requireUser(req);
+
+  const supabase = getSupabaseAdmin();
+
+  let clientInfo: { business_name: string; mrr: number | null } | null = null;
+  if (clientId) {
+    const { data } = await supabase
+      .from('clients')
+      .select('business_name, contact_name, email, phone, website, industry, mrr')
+      .eq('id', clientId)
+      .maybeSingle();
+    if (data) clientInfo = data as typeof clientInfo;
+  }
+
+  const isRevision = Boolean(revisionFeedback && existingContent);
+
+  if (isRevision) {
+    const { text } = await callGemini({
+      messages: [
+        { role: 'system', content: REVISION_SYSTEM },
+        { role: 'user', content: `Please revise this existing contract based on the feedback provided.
+
+EXISTING CONTRACT:
+${existingContent}
+
+REVISION FEEDBACK:
+${revisionFeedback}
+
+Return only the revised contract content with no markdown formatting.` },
+      ],
+      maxTokens: 8_000,
+    });
+    log.info('contract_revised', { length: text.length });
+    return jsonResponse({ content: stripMarkdown(text) });
+  }
+
+  // New contract — pull default template.
+  const { data: template, error: templateError } = await supabase
+    .from('contract_templates')
+    .select('content')
+    .eq('is_default', true)
+    .maybeSingle();
+  if (templateError) throw new Error(templateError.message);
+  if (!template) throw notFound('No default contract template found');
+
+  const clientName = clientInfo?.business_name ?? 'Client';
+  const formatPaymentAmount = (): string => {
+    const amount = paymentAmount ?? clientInfo?.mrr ?? 0;
+    if (billingInterval && billingInterval !== 'one_time') {
+      const intervalMap: Record<BillingInterval, string> = { monthly: 'month', quarterly: 'quarter', yearly: 'year', one_time: 'one_time' };
+      const intervalLabel = intervalMap[billingInterval];
+      if (initialPaymentAmount && initialPaymentAmount !== amount) {
+        return `${initialPaymentAmount.toLocaleString()} ${paymentCurrency} for the first ${intervalLabel}, then ${amount.toLocaleString()} ${paymentCurrency} per ${intervalLabel}`;
+      }
+      return `${amount.toLocaleString()} ${paymentCurrency} per ${intervalLabel}`;
+    }
+    return `${amount.toLocaleString()} ${paymentCurrency}`;
+  };
+
+  let content = template.content as string;
+  const replacements: Record<string, string> = {
+    '[EFFECTIVE DATE]': formatDate(startDate ?? undefined),
+    '[CLIENT]': clientName,
+    '[END DATE]': formatDate(endDate ?? undefined),
+    '[MONTHLY FEE]': formatPaymentAmount(),
+    '[GOVERNING JURISDICTION]': governingJurisdiction,
+  };
+  for (const [placeholder, value] of Object.entries(replacements)) {
+    content = content.split(placeholder).join(value);
+  }
+
+  if (scopeOfWork?.trim()) {
+    try {
+      const { text } = await callGemini({
+        messages: [
+          { role: 'system', content: SCOPE_REWRITE_SYSTEM },
+          { role: 'user', content: `Update Section 2 (SCOPE OF SERVICES) based on this custom scope:
 
 ${scopeOfWork}
 
 ${deliverables ? `Deliverables to include: ${deliverables}` : ''}
 
-Return ONLY the Section 2 content, starting with "2. SCOPE OF SERVICES"`;
-
-        try {
-          const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${GOOGLE_AI_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              model: 'gemini-2.5-flash',
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-              ],
-            }),
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            let newSection2 = data.choices?.[0]?.message?.content;
-
-            if (newSection2) {
-              // Clean markdown from AI response
-              newSection2 = newSection2
-                .replace(/\*\*/g, '')
-                .replace(/\*/g, '')
-                .replace(/^#+\s*/gm, '')
-                .replace(/`([^`]+)`/g, '$1');
-
-              // Replace Section 2 in the template
-              const section2Start = content.indexOf('2. SCOPE OF SERVICES');
-              const section3Start = content.indexOf('3. DELIVERABLES');
-              
-              if (section2Start !== -1 && section3Start !== -1) {
-                content = content.substring(0, section2Start) + 
-                          newSection2.trim() + 
-                          '\n\n' + 
-                          content.substring(section3Start);
-              }
-            }
-          }
-        } catch (aiError) {
-          console.log('AI enhancement failed, using template as-is:', aiError);
-        }
+Return ONLY the Section 2 content, starting with "2. SCOPE OF SERVICES"` },
+        ],
+        maxTokens: 4_000,
+      });
+      const newSection2 = stripMarkdown(text).trim();
+      const s2 = content.indexOf('2. SCOPE OF SERVICES');
+      const s3 = content.indexOf('3. DELIVERABLES');
+      if (s2 !== -1 && s3 !== -1) {
+        content = `${content.substring(0, s2)}${newSection2}\n\n${content.substring(s3)}`;
       }
+    } catch (err) {
+      log.warn('scope_rewrite_failed', { error: err instanceof Error ? err.message : String(err) });
     }
-
-    console.log('Generated contract for client:', clientName);
-
-    return new Response(
-      JSON.stringify({ content }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-
-  } catch (error) {
-    console.error('Error in generate-contract:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    return new Response(
-      JSON.stringify({ error: errorMessage }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
   }
-});
+
+  log.info('contract_generated', { clientName, length: content.length });
+  return jsonResponse({ content });
+}));

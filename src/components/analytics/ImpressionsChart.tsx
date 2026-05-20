@@ -3,8 +3,19 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid } from 'recharts';
 import { format, parseISO } from 'date-fns';
 
+interface PostAnalyticsItem {
+  posted_at?: string;
+  publishedAt?: string;
+  postedAt?: string;
+  createdAt?: string;
+  views?: number;
+  impressions?: number;
+  analytics?: PostAnalyticsItem | PostAnalyticsItem[];
+  [key: string]: unknown;
+}
+
 interface ImpressionsChartProps {
-  postAnalytics: Array<any>;
+  postAnalytics: PostAnalyticsItem[];
 }
 
 export function ImpressionsChart({ postAnalytics }: ImpressionsChartProps) {
@@ -14,7 +25,7 @@ export function ImpressionsChart({ postAnalytics }: ImpressionsChartProps) {
   postAnalytics.forEach((item) => {
     // Handle nested format: { accountId, platform, analytics: [...] }
     if (item.analytics && Array.isArray(item.analytics)) {
-      item.analytics.forEach((post: any) => {
+      item.analytics.forEach((post: PostAnalyticsItem) => {
         const dateStr = post.posted_at || post.publishedAt || post.postedAt || post.createdAt;
         const views = post.views || post.impressions || post.analytics?.views || post.analytics?.impressions || 0;
         if (dateStr && views) {

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  frontend:
+    name: Frontend (build + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Build
+        run: bun run build
+
+      - name: Upload bundle stats
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  edge-functions:
+    name: Edge functions (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Type-checks every edge function. Each function is self-contained
+      # (Deno entry point) so we type-check them individually.
+      - name: Type-check edge functions
+        run: |
+          set -e
+          for fn in supabase/functions/*/index.ts; do
+            echo "::group::Type-check $fn"
+            deno check --allow-import "$fn"
+            echo "::endgroup::"
+          done
+
+      # Smoke tests for the shared library. Adds confidence that
+      # shared changes don't quietly break every function.
+      - name: Run shared lib tests
+        run: deno test --allow-net --allow-env supabase/functions/_shared/__tests__/

@@ -1,204 +1,52 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/**
+ * AI text-post chat / rewrite endpoint.
+ *
+ * Two flows on the same function:
+ *   - `action: 'rewrite'` — rewrites a single post in a chosen style.
+ *   - default — generates new posts grounded in the client's knowledge base
+ *               and (optionally) their top-performing past posts.
+ *
+ * Contract preserved:
+ *   Rewrite:  Request { clientId, platform, action:'rewrite', rewriteStyle, originalContent, customPrompt? }
+ *             Response { rewrittenContent }
+ *   Generate: Request { clientId, platform, message, guidelines?, conversationHistory?, topPostsContext? }
+ *             Response { message, posts: string[] }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { rateLimited, notFound } from '../_shared/errors.ts';
+import { ensureArray, ensureEnum, ensureNonEmptyString, ensureOptionalArray, ensureOptionalString, ensureRecord, ensureUuid } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireClientAccess } from '../_shared/auth.ts';
+import { callAnthropic, type AnthropicMessage } from '../_shared/anthropic.ts';
+import { checkRateLimit } from '../_shared/rate-limit.ts';
 
-// Simple in-memory rate limiter (per-function instance)
-const rateLimitMap = new Map<string, number[]>();
-const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 20; // 20 requests per minute per client
-
-function checkRateLimit(clientId: string): { allowed: boolean; waitTime: number } {
-  const now = Date.now();
-  const timestamps = rateLimitMap.get(clientId) || [];
-  
-  // Remove timestamps outside the window
-  const validTimestamps = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-  
-  if (validTimestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
-    const oldestTimestamp = validTimestamps[0];
-    const waitTime = Math.ceil((oldestTimestamp + RATE_LIMIT_WINDOW_MS - now) / 1000);
-    return { allowed: false, waitTime };
-  }
-  
-  // Record this request
-  validTimestamps.push(now);
-  rateLimitMap.set(clientId, validTimestamps);
-  
-  return { allowed: true, waitTime: 0 };
+interface RequestBody {
+  clientId: unknown;
+  platform: unknown;
+  action?: unknown;
+  rewriteStyle?: unknown;
+  originalContent?: unknown;
+  customPrompt?: unknown;
+  message?: unknown;
+  guidelines?: unknown;
+  conversationHistory?: unknown;
+  topPostsContext?: unknown;
 }
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
+const REWRITE_STYLES = ['shorter', 'punchier', 'professional', 'emoji', 'custom'] as const;
+type RewriteStyle = typeof REWRITE_STYLES[number];
 
-  try {
-    const body = await req.json();
-    const { clientId, platform, action } = body;
+const REWRITE_PROMPTS: Record<RewriteStyle, string> = {
+  shorter: 'Rewrite this post to be more concise while keeping the core message. Remove filler words and unnecessary phrases. Keep the same tone.',
+  punchier: 'Rewrite this post to be more attention-grabbing and energetic. Add impactful hooks and dynamic language while keeping the message.',
+  professional: 'Rewrite this post in a more professional, polished tone. Make it suitable for a business audience while maintaining the core message.',
+  emoji: "Add relevant emojis to this post to make it more engaging. Place them strategically but don't overdo it. Keep the original text mostly intact.",
+  custom: 'Improve this post.',
+};
 
-    if (!clientId || !platform) {
-      return new Response(
-        JSON.stringify({ error: 'clientId and platform are required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Check rate limit
-    const rateLimitCheck = checkRateLimit(clientId);
-    if (!rateLimitCheck.allowed) {
-      console.log(`Rate limit exceeded for client ${clientId}. Wait ${rateLimitCheck.waitTime}s`);
-      return new Response(
-        JSON.stringify({ 
-          error: `Rate limit exceeded. Please wait ${rateLimitCheck.waitTime} seconds before making another request.`,
-          rateLimited: true,
-          waitTime: rateLimitCheck.waitTime
-        }),
-        { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const anthropicApiKey = Deno.env.get('ANTHROPIC_API_KEY');
-
-    if (!anthropicApiKey) {
-      throw new Error('ANTHROPIC_API_KEY is not configured');
-    }
-
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    // Handle rewrite action
-    if (action === 'rewrite') {
-      const { rewriteStyle, originalContent, customPrompt } = body;
-
-      if (!rewriteStyle || !originalContent) {
-        return new Response(
-          JSON.stringify({ error: 'rewriteStyle and originalContent are required for rewrite action' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      const rewritePrompts: Record<string, string> = {
-        shorter: 'Rewrite this post to be more concise while keeping the core message. Remove filler words and unnecessary phrases. Keep the same tone.',
-        punchier: 'Rewrite this post to be more attention-grabbing and energetic. Add impactful hooks and dynamic language while keeping the message.',
-        professional: 'Rewrite this post in a more professional, polished tone. Make it suitable for a business audience while maintaining the core message.',
-        emoji: 'Add relevant emojis to this post to make it more engaging. Place them strategically but don\'t overdo it. Keep the original text mostly intact.',
-        custom: customPrompt || 'Improve this post.',
-      };
-
-      const prompt = rewritePrompts[rewriteStyle] || rewritePrompts.shorter;
-
-      console.log('Rewriting post with style:', rewriteStyle, 'using Claude Sonnet 4.5');
-
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': anthropicApiKey,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2048,
-          system: `You are a social media content editor. Your task is to rewrite posts according to specific instructions. 
-              
-IMPORTANT: Output ONLY the rewritten post content. No explanations, no quotation marks around the entire response, no prefixes like "Here's the rewritten post:". Just the post itself.`,
-          messages: [
-            {
-              role: 'user',
-              content: `${prompt}\n\nOriginal post:\n${originalContent}`
-            }
-          ],
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Anthropic API error:', response.status, errorText);
-        
-        if (response.status === 429) {
-          return new Response(
-            JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }),
-            { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        if (response.status === 529) {
-          return new Response(
-            JSON.stringify({ error: 'API is overloaded. Please try again shortly.' }),
-            { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        throw new Error(`Anthropic API error: ${response.status}`);
-      }
-
-      const aiResponse = await response.json();
-      const rewrittenContent = aiResponse.content?.[0]?.text?.trim();
-
-      if (!rewrittenContent) {
-        throw new Error('No response from AI');
-      }
-
-      return new Response(
-        JSON.stringify({ rewrittenContent }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Handle generate action (original flow)
-    const { message, guidelines, conversationHistory, topPostsContext } = body;
-
-    if (!message) {
-      return new Response(
-        JSON.stringify({ error: 'message is required for generation' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Fetch client info
-    const { data: client } = await supabase
-      .from('clients')
-      .select('*')
-      .eq('id', clientId)
-      .single();
-
-    if (!client) {
-      return new Response(
-        JSON.stringify({ error: 'Client not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Fetch knowledge entries
-    const { data: knowledgeEntries } = await supabase
-      .from('knowledge_entries')
-      .select('*')
-      .eq('client_id', clientId);
-
-    const { data: knowledgeSummary } = await supabase
-      .from('knowledge_summary')
-      .select('*')
-      .eq('client_id', clientId)
-      .single();
-
-    // Build knowledge context
-    const groupedKnowledge: Record<string, string[]> = {};
-    knowledgeEntries?.forEach(entry => {
-      const cat = entry.category.toUpperCase();
-      if (!groupedKnowledge[cat]) groupedKnowledge[cat] = [];
-      groupedKnowledge[cat].push(`• ${entry.title}: ${entry.content}`);
-    });
-
-    const knowledgeContext = Object.entries(groupedKnowledge)
-      .map(([category, entries]) => `=== ${category} ===\n${entries.join('\n')}`)
-      .join('\n\n') || 'No knowledge base entries yet.';
-
-    // Platform-specific instructions (only used if no custom guidelines provided)
-    const platformInstructions: Record<string, string> = {
-      linkedin: `
+const PLATFORM_INSTRUCTIONS: Record<string, string> = {
+  linkedin: `
 LINKEDIN POST GUIDELINES:
 - Write professional, thought-leadership style content
 - Optimal length: 1,300-2,000 characters for maximum engagement
@@ -209,7 +57,7 @@ LINKEDIN POST GUIDELINES:
 - Consider using bullet points or numbered lists for key points
 - Avoid hashtags in the main body; if used, limit to 3-5 at the end
 `,
-      twitter: `
+  twitter: `
 TWITTER/X POST GUIDELINES:
 - Maximum 280 characters per tweet
 - If creating a thread, number each tweet (1/, 2/, etc.)
@@ -220,7 +68,7 @@ TWITTER/X POST GUIDELINES:
 - Hashtags: Use 1-2 maximum, or none if not relevant
 - Consider using line breaks for visual impact within the 280 limit
 `,
-      threads: `
+  threads: `
 THREADS POST GUIDELINES:
 - Similar to Instagram/Twitter hybrid style
 - Maximum 500 characters per post
@@ -230,12 +78,74 @@ THREADS POST GUIDELINES:
 - First line is crucial - make it scroll-stopping
 - Good for storytelling and personal insights
 `,
-    };
+};
 
-    // Build the system prompt - ALWAYS include client context
-    const platformSection = platformInstructions[platform] || '';
+const REWRITE_SYSTEM = `You are a social media content editor. Your task is to rewrite posts according to specific instructions.
 
-    let systemPrompt = `You are an expert content writer specializing in ${platform.toUpperCase()} content for ${client.business_name}.
+IMPORTANT: Output ONLY the rewritten post content. No explanations, no quotation marks around the entire response, no prefixes like "Here's the rewritten post:". Just the post itself.`;
+
+interface TopPost { caption?: string; impressions?: number; likes?: number; comments?: number; shares?: number }
+
+Deno.serve(withErrorHandling({ fn: 'ai-text-posts' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const clientId = ensureUuid('clientId', body.clientId);
+  const platform = ensureNonEmptyString('platform', body.platform, 50).toLowerCase();
+  const action = ensureOptionalString('action', body.action, 50);
+
+  await requireClientAccess(req, clientId);
+
+  const supabase = getSupabaseAdmin();
+  const rl = await checkRateLimit({ bucket: 'ai-text-posts', subject: clientId, windowSec: 60, max: 20, supabase });
+  if (!rl.allowed) throw rateLimited(`Rate limit exceeded. Please wait ${rl.waitTime} seconds before making another request.`, rl.waitTime);
+
+  if (action === 'rewrite') {
+    const rewriteStyle = ensureEnum<RewriteStyle>('rewriteStyle', body.rewriteStyle, REWRITE_STYLES);
+    const originalContent = ensureNonEmptyString('originalContent', body.originalContent, 50_000);
+    const customPrompt = ensureOptionalString('customPrompt', body.customPrompt, 5_000);
+    const promptText = rewriteStyle === 'custom' ? (customPrompt ?? REWRITE_PROMPTS.custom) : REWRITE_PROMPTS[rewriteStyle];
+
+    const { text } = await callAnthropic({
+      system: REWRITE_SYSTEM,
+      messages: [{ role: 'user', content: `${promptText}\n\nOriginal post:\n${originalContent}` }],
+      maxTokens: 2_048,
+    });
+    log.info('post_rewritten', { style: rewriteStyle });
+    return jsonResponse({ rewrittenContent: text.trim() });
+  }
+
+  const message = ensureNonEmptyString('message', body.message, 50_000);
+  const guidelines = ensureOptionalString('guidelines', body.guidelines, 50_000);
+  const conversationHistory = ensureOptionalArray('conversationHistory', body.conversationHistory, (item, i) => {
+    const obj = ensureRecord(`conversationHistory[${i}]`, item);
+    return {
+      role: ensureEnum(`conversationHistory[${i}].role`, obj.role, ['user', 'assistant'] as const),
+      content: ensureNonEmptyString(`conversationHistory[${i}].content`, obj.content, 50_000),
+    } as AnthropicMessage;
+  }, { max: 200 }) ?? [];
+  const topPostsContext = ensureOptionalArray('topPostsContext', body.topPostsContext, (item, i) => {
+    const obj = ensureRecord(`topPostsContext[${i}]`, item) as TopPost;
+    return obj;
+  }, { max: 50 }) ?? [];
+
+  const { data: client } = await supabase.from('clients').select('*').eq('id', clientId).maybeSingle();
+  if (!client) throw notFound('Client not found');
+
+  const { data: knowledgeEntries } = await supabase.from('knowledge_entries').select('*').eq('client_id', clientId);
+  const { data: knowledgeSummary } = await supabase.from('knowledge_summary').select('*').eq('client_id', clientId).maybeSingle();
+
+  const grouped: Record<string, string[]> = {};
+  for (const entry of knowledgeEntries ?? []) {
+    const cat = (entry.category as string).toUpperCase();
+    grouped[cat] ??= [];
+    grouped[cat].push(`• ${entry.title}: ${entry.content}`);
+  }
+  const knowledgeContext = Object.entries(grouped)
+    .map(([category, entries]) => `=== ${category} ===\n${entries.join('\n')}`)
+    .join('\n\n') || 'No knowledge base entries yet.';
+
+  const platformSection = PLATFORM_INSTRUCTIONS[platform] ?? '';
+
+  let systemPrompt = `You are an expert content writer specializing in ${platform.toUpperCase()} content for ${client.business_name}.
 
 ═══════════════════════════════════════════════════════════════
 CLIENT PROFILE: ${client.business_name}
@@ -244,13 +154,13 @@ Industry: ${client.industry}
 Contact: ${client.contact_name}
 
 ▸ BRAND POSITIONING:
-${knowledgeSummary?.positioning_summary || 'Not yet defined'}
+${knowledgeSummary?.positioning_summary ?? 'Not yet defined'}
 
 ▸ KEY DIFFERENTIATORS:
-${knowledgeSummary?.key_differentiators?.map((d: string) => `• ${d}`).join('\n') || 'Not yet defined'}
+${(knowledgeSummary?.key_differentiators ?? []).map((d: string) => `• ${d}`).join('\n') || 'Not yet defined'}
 
 ▸ IDEAL CUSTOMER PROFILE:
-${knowledgeSummary?.ideal_customer_profile || 'Not yet defined'}
+${knowledgeSummary?.ideal_customer_profile ?? 'Not yet defined'}
 
 ═══════════════════════════════════════════════════════════════
 KNOWLEDGE BASE
@@ -258,25 +168,28 @@ KNOWLEDGE BASE
 ${knowledgeContext}
 `;
 
-    // Add custom guidelines if provided, otherwise use platform defaults
-    if (guidelines) {
-      systemPrompt += `
+  if (guidelines) {
+    systemPrompt += `
 ═══════════════════════════════════════════════════════════════
 WRITING STYLE GUIDELINES (FOLLOW THESE STRICTLY)
 ═══════════════════════════════════════════════════════════════
 ${guidelines}
 `;
-    } else if (platformSection) {
-      systemPrompt += `
+  } else if (platformSection) {
+    systemPrompt += `
 ═══════════════════════════════════════════════════════════════
 ${platformSection}
 ═══════════════════════════════════════════════════════════════
 `;
-    }
+  }
 
-    // Add top posts context if provided (for generating ideas based on past performance)
-    if (topPostsContext && Array.isArray(topPostsContext) && topPostsContext.length > 0) {
-      systemPrompt += `
+  if (topPostsContext.length > 0) {
+    const list = topPostsContext.map((p, i) => {
+      const captionFull = p.caption ?? 'No caption';
+      const caption = captionFull.length > 200 ? `${captionFull.slice(0, 200)}...` : captionFull;
+      return `\n${i + 1}. "${caption}"\n   📊 Impressions: ${(p.impressions ?? 0).toLocaleString()} | ❤️ Likes: ${(p.likes ?? 0).toLocaleString()} | 💬 Comments: ${(p.comments ?? 0).toLocaleString()} | 🔄 Shares: ${(p.shares ?? 0).toLocaleString()}`;
+    }).join('\n');
+    systemPrompt += `
 ═══════════════════════════════════════════════════════════════
 TOP PERFORMING POSTS ANALYSIS
 ═══════════════════════════════════════════════════════════════
@@ -290,16 +203,12 @@ Analyze these for:
 Use these insights to generate new posts that capture similar success factors
 while bringing fresh perspectives and ideas.
 
-TOP POSTS:
-${topPostsContext.map((p: any, i: number) => `
-${i + 1}. "${p.caption?.slice(0, 200) || 'No caption'}${p.caption && p.caption.length > 200 ? '...' : ''}"
-   📊 Impressions: ${p.impressions?.toLocaleString() || 0} | ❤️ Likes: ${p.likes?.toLocaleString() || 0} | 💬 Comments: ${p.comments?.toLocaleString() || 0} | 🔄 Shares: ${p.shares?.toLocaleString() || 0}
-`).join('\n')}
+TOP POSTS:${list}
 ═══════════════════════════════════════════════════════════════
 `;
-    }
+  }
 
-    systemPrompt += `
+  systemPrompt += `
 CRITICAL INSTRUCTIONS:
 1. Generate ready-to-post content that requires minimal editing
 2. Use the client's knowledge base to inform your content
@@ -318,81 +227,19 @@ CRITICAL INSTRUCTIONS:
 
 This format helps with parsing. Include the full post content between each marker.`;
 
-    console.log('Calling Claude Sonnet 4.5 for text posts...', { platform, hasGuidelines: !!guidelines });
+  const messages: AnthropicMessage[] = [
+    ...conversationHistory,
+    { role: 'user', content: message },
+  ];
 
-    // Convert conversation history to Anthropic format
-    const anthropicMessages = [
-      ...(conversationHistory || []).map((msg: { role: string; content: string }) => ({
-        role: msg.role === 'assistant' ? 'assistant' : 'user',
-        content: msg.content
-      })),
-      { role: 'user', content: message }
-    ];
+  const { text } = await callAnthropic({ system: systemPrompt, messages, maxTokens: 8_192 });
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': anthropicApiKey,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 8192,
-        system: systemPrompt,
-        messages: anthropicMessages,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Anthropic API error:', response.status, errorText);
-      
-      if (response.status === 429) {
-        return new Response(
-          JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }),
-          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      if (response.status === 529) {
-        return new Response(
-          JSON.stringify({ error: 'API is overloaded. Please try again shortly.' }),
-          { status: 503, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      throw new Error(`Anthropic API error: ${response.status}`);
-    }
-
-    const aiResponse = await response.json();
-    const assistantMessage = aiResponse.content?.[0]?.text;
-
-    if (!assistantMessage) {
-      throw new Error('No response from AI');
-    }
-
-    // Extract posts from the response
-    const posts: string[] = [];
-    const postMatches = assistantMessage.matchAll(/---POST \d+---\s*([\s\S]*?)(?=---POST \d+---|$)/g);
-    for (const match of postMatches) {
-      const postContent = match[1].trim();
-      if (postContent) {
-        posts.push(postContent);
-      }
-    }
-
-    return new Response(
-      JSON.stringify({
-        message: assistantMessage,
-        posts,
-      }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-
-  } catch (error) {
-    console.error('Error in ai-text-posts:', error);
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+  const posts: string[] = [];
+  for (const match of text.matchAll(/---POST \d+---\s*([\s\S]*?)(?=---POST \d+---|$)/g)) {
+    const post = match[1].trim();
+    if (post) posts.push(post);
   }
-});
+
+  log.info('text_posts_generated', { platform, posts: posts.length });
+  return jsonResponse({ message: text, posts });
+}));

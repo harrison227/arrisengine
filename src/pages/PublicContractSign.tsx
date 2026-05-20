@@ -16,7 +16,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { usePublicContract } from '@/hooks/useContractShareLinks';
 import { useContractSignatures, SignatureInput } from '@/hooks/useContractSignatures';
 import { SignatureCanvas } from '@/components/contract-signing/SignatureCanvas';
-import { downloadContractPdf } from '@/lib/contractPdf';
+// downloadContractPdf is dynamically imported on demand — keeps jspdf out of the main bundle.
 import { format } from 'date-fns';
 import { cn } from '@/lib/utils';
 import { supabase } from '@/integrations/supabase/client';
@@ -166,8 +166,9 @@ export default function PublicContractSign() {
     }
   };
 
-  const handleDownloadPdf = () => {
-    downloadContractPdf(contract, client, { 
+  const handleDownloadPdf = async () => {
+    const { downloadContractPdf } = await import('@/lib/contractPdf');
+    downloadContractPdf(contract, client, {
       agencyName: 'Arris Studios',
       agencySignature: agencySignature ? {
         signer_name: agencySignature.signer_name,

@@ -11,7 +11,42 @@ import { useAgencySettings } from '@/hooks/useAgencySettings';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import { OnboardingConfigDialog, OnboardingConfig } from '@/components/dialogs/OnboardingConfigDialog';
-import jsPDF from 'jspdf';
+// jsPDF is dynamically imported inside downloadPDF — keeps it out of the main bundle.
+
+// Response shape from the generate-onboarding-pdf edge function.
+interface OnboardingPdfData {
+  success: boolean;
+  client: {
+    id: string;
+    business_name: string;
+    contact_name: string | null;
+    email: string | null;
+    phone: string | null;
+    website: string | null;
+    industry: string | null;
+    mrr: number | null;
+    status: string;
+  };
+  knowledgeSummary: {
+    positioning_summary: string | null;
+    key_differentiators: string[];
+    content_opportunities: string[];
+    compliance_flags: string[];
+    ideal_customer_profile: string | null;
+  } | null;
+  agencySettings: {
+    agency_name: string | null;
+    logo_url: string | null;
+    primary_color: string | null;
+  } | null;
+  config: {
+    platforms: Record<string, boolean>;
+    assetNeeds: Record<string, boolean>;
+    customNote: string;
+  };
+  generatedAt: string;
+  error?: string;
+}
 
 // Helper to convert hex to RGB
 const hexToRgb = (hex: string): { r: number; g: number; b: number } => {
@@ -97,9 +132,10 @@ export default function Onboarding() {
     }
   };
 
-  const downloadPDF = async (data: any, config: OnboardingConfig) => {
+  const downloadPDF = async (data: OnboardingPdfData, config: OnboardingConfig) => {
     if (!client) return;
 
+    const { default: jsPDF } = await import('jspdf');
     const pdf = new jsPDF('p', 'mm', 'a4');
     const pageWidth = pdf.internal.pageSize.getWidth();
     const pageHeight = pdf.internal.pageSize.getHeight();

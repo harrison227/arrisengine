@@ -1,247 +1,100 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+/**
+ * Scrape a client's marketing site via Firecrawl: main page + key sub-pages
+ * (about / services / products / pricing / team / contact).
+ *
+ * Contract preserved:
+ *   Request:  { url }
+ *   Response: { success, data: { mainPage, additionalPages, siteLinks } }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { badRequest, upstream } from '../_shared/errors.ts';
+import { ensureNonEmptyString } from '../_shared/validation.ts';
+import { requireUser } from '../_shared/auth.ts';
+import { requireEnv } from '../_shared/env.ts';
+import { timeoutSignal } from '../_shared/retry.ts';
+import { isPublicHttpUrl, normalizeUrl } from '../_shared/url-safety.ts';
 
-// Input validation helpers
-function isValidUrl(urlString: string): boolean {
-  try {
-    const url = new URL(urlString);
-    // Only allow http and https protocols
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
+const FIRECRAWL_BASE = 'https://api.firecrawl.dev/v1';
+const KEY_PAGE_KEYWORDS = ['about', 'service', 'product', 'pricing', 'team', 'contact'] as const;
+
+interface RequestBody { url: unknown }
+
+interface FirecrawlScrapeResult {
+  success?: boolean;
+  data?: { markdown?: string; branding?: unknown; metadata?: Record<string, unknown> };
+  error?: string;
 }
 
-function sanitizeUrl(url: string): string {
-  // Remove any control characters and trim
-  return url.replace(/[\x00-\x1F\x7F]/g, '').trim();
+interface FirecrawlMapResult { links?: string[] }
+
+async function firecrawl(path: string, body: Record<string, unknown>, apiKey: string): Promise<unknown> {
+  const res = await fetch(`${FIRECRAWL_BASE}${path}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: timeoutSignal(60_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw upstream(`Firecrawl ${path} failed (${res.status}): ${text.slice(0, 300)}`, 502);
+  }
+  return res.json();
 }
 
-// Block internal/private IP ranges to prevent SSRF
-function isPrivateUrl(urlString: string): boolean {
-  try {
-    const url = new URL(urlString);
-    const hostname = url.hostname.toLowerCase();
-    
-    // Block localhost and private IPs
-    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0') {
-      return true;
-    }
-    
-    // Block private IP ranges
-    const privateRanges = [
-      /^10\./,
-      /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
-      /^192\.168\./,
-      /^169\.254\./,
-      /^::1$/,
-      /^fc00:/i,
-      /^fe80:/i,
-    ];
-    
-    for (const range of privateRanges) {
-      if (range.test(hostname)) {
-        return true;
-      }
-    }
-    
-    // Block internal domains
-    const blockedDomains = ['internal', 'intranet', 'localhost', 'local'];
-    for (const domain of blockedDomains) {
-      if (hostname.includes(domain)) {
-        return true;
-      }
-    }
-    
-    return false;
-  } catch {
-    return true; // If we can't parse it, block it
-  }
-}
+Deno.serve(withErrorHandling({ fn: 'scrape-client-website' }, async ({ req, log }) => {
+  await requireUser(req);
+  const apiKey = requireEnv('FIRECRAWL_API_KEY');
+  const body = await parseJsonBody<RequestBody>(req);
+  const rawUrl = ensureNonEmptyString('url', body.url, 2_048);
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
+  const formattedUrl = normalizeUrl(rawUrl);
+  if (!isPublicHttpUrl(formattedUrl)) throw badRequest('Invalid or private URL — must be a public http(s) URL');
+
+  log.info('scrape_start', { url: formattedUrl });
+
+  const [mapData, scrapeData] = await Promise.all([
+    firecrawl('/map', { url: formattedUrl, limit: 20, includeSubdomains: false }, apiKey).catch((err) => {
+      log.warn('map_failed', { error: err instanceof Error ? err.message : String(err) });
+      return {} as FirecrawlMapResult;
+    }) as Promise<FirecrawlMapResult>,
+    firecrawl('/scrape', { url: formattedUrl, formats: ['markdown', 'branding'], onlyMainContent: true }, apiKey) as Promise<FirecrawlScrapeResult>,
+  ]);
+
+  const siteLinks = (mapData.links ?? []).filter((l): l is string => typeof l === 'string' && isPublicHttpUrl(l));
+
+  const keyPages: string[] = [];
+  for (const link of siteLinks) {
+    if (keyPages.length >= 5) break;
+    const lower = link.toLowerCase();
+    if (KEY_PAGE_KEYWORDS.some((k) => lower.includes(k))) keyPages.push(link);
   }
 
-  try {
-    // Parse and validate request body
-    let body;
+  const additionalContent: Array<{ url: string; markdown: string }> = [];
+  for (const pageUrl of keyPages) {
     try {
-      body = await req.json();
-    } catch {
-      return new Response(
-        JSON.stringify({ success: false, error: 'Invalid JSON request body' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const { url } = body;
-
-    // Validate URL presence
-    if (!url || typeof url !== 'string') {
-      return new Response(
-        JSON.stringify({ success: false, error: 'URL is required and must be a string' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Validate URL length (prevent oversized requests)
-    if (url.length > 2048) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'URL exceeds maximum length of 2048 characters' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Sanitize and format URL
-    let formattedUrl = sanitizeUrl(url);
-    if (!formattedUrl.startsWith('http://') && !formattedUrl.startsWith('https://')) {
-      formattedUrl = `https://${formattedUrl}`;
-    }
-
-    // Validate URL format
-    if (!isValidUrl(formattedUrl)) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'Invalid URL format' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Block private/internal URLs (SSRF prevention)
-    if (isPrivateUrl(formattedUrl)) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'Access to private or internal URLs is not allowed' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const apiKey = Deno.env.get('FIRECRAWL_API_KEY');
-    if (!apiKey) {
-      console.error('FIRECRAWL_API_KEY not configured');
-      return new Response(
-        JSON.stringify({ success: false, error: 'Firecrawl connector not configured' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    console.log('Scraping client website:', formattedUrl);
-
-    // First, get the sitemap to find key pages
-    const mapResponse = await fetch('https://api.firecrawl.dev/v1/map', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: formattedUrl,
-        limit: 20,
-        includeSubdomains: false,
-      }),
-    });
-
-    const mapData = await mapResponse.json();
-    console.log('Map result received');
-
-    // Get main page with branding and content
-    const scrapeResponse = await fetch('https://api.firecrawl.dev/v1/scrape', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: formattedUrl,
-        formats: ['markdown', 'branding'],
-        onlyMainContent: true,
-      }),
-    });
-
-    const scrapeData = await scrapeResponse.json();
-
-    if (!scrapeResponse.ok) {
-      console.error('Firecrawl scrape error:', scrapeData);
-      return new Response(
-        JSON.stringify({ success: false, error: scrapeData.error || 'Failed to scrape website' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Find and scrape key pages (about, services, products)
-    const keyPageKeywords = ['about', 'service', 'product', 'pricing', 'team', 'contact'];
-    const siteLinks = mapData.links || [];
-    const keyPages: string[] = [];
-    
-    for (const link of siteLinks) {
-      // Validate each discovered link before adding
-      if (typeof link === 'string' && isValidUrl(link) && !isPrivateUrl(link)) {
-        const lowerLink = link.toLowerCase();
-        if (keyPageKeywords.some(keyword => lowerLink.includes(keyword)) && keyPages.length < 5) {
-          keyPages.push(link);
-        }
+      const pageData = (await firecrawl('/scrape', { url: pageUrl, formats: ['markdown'], onlyMainContent: true }, apiKey)) as FirecrawlScrapeResult;
+      if (pageData.success && pageData.data?.markdown) {
+        additionalContent.push({ url: pageUrl, markdown: pageData.data.markdown });
       }
+    } catch (err) {
+      log.warn('subpage_failed', { url: pageUrl, error: err instanceof Error ? err.message : String(err) });
     }
-
-    // Scrape key pages
-    const additionalContent: Array<{ url: string; markdown: string }> = [];
-    
-    for (const pageUrl of keyPages) {
-      try {
-        console.log('Scraping additional page:', pageUrl);
-        const pageResponse = await fetch('https://api.firecrawl.dev/v1/scrape', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            url: pageUrl,
-            formats: ['markdown'],
-            onlyMainContent: true,
-          }),
-        });
-
-        const pageData = await pageResponse.json();
-        if (pageData.success && pageData.data?.markdown) {
-          additionalContent.push({
-            url: pageUrl,
-            markdown: pageData.data.markdown,
-          });
-        }
-      } catch (e) {
-        console.error('Error scraping page:', pageUrl, e);
-      }
-    }
-
-    const result = {
-      success: true,
-      data: {
-        mainPage: {
-          url: formattedUrl,
-          markdown: scrapeData.data?.markdown || '',
-          branding: scrapeData.data?.branding || null,
-          metadata: scrapeData.data?.metadata || {},
-        },
-        additionalPages: additionalContent,
-        siteLinks: siteLinks.slice(0, 50),
-      }
-    };
-
-    console.log('Scrape completed successfully');
-    return new Response(
-      JSON.stringify(result),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error in scrape-client-website:', error);
-    return new Response(
-      JSON.stringify({ success: false, error: 'An unexpected error occurred' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
   }
-});
+
+  log.info('scrape_done', { mainBytes: scrapeData.data?.markdown?.length ?? 0, subPages: additionalContent.length });
+
+  return jsonResponse({
+    success: true,
+    data: {
+      mainPage: {
+        url: formattedUrl,
+        markdown: scrapeData.data?.markdown ?? '',
+        branding: scrapeData.data?.branding ?? null,
+        metadata: scrapeData.data?.metadata ?? {},
+      },
+      additionalPages: additionalContent,
+      siteLinks: siteLinks.slice(0, 50),
+    },
+  });
+}));

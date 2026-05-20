@@ -18,7 +18,7 @@ import { useContractSignatures } from '@/hooks/useContractSignatures';
 import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import { format } from 'date-fns';
-import { downloadContractPdf } from '@/lib/contractPdf';
+// downloadContractPdf is dynamically imported on demand — keeps jspdf out of the main bundle.
 import { GenerateContractShareLinkDialog } from '@/components/dialogs/GenerateContractShareLinkDialog';
 
 interface ContractsTabProps {
@@ -481,6 +481,7 @@ export function ContractsTab({ clientId }: ContractsTabProps) {
       const clientSig = signatures?.find(s => s.signer_role === 'client' && s.signed_at);
 
       // Call the proper PDF generator with signatures
+      const { downloadContractPdf } = await import('@/lib/contractPdf');
       await downloadContractPdf(contract, client, {
         agencyName: agencyName || 'Arris Studios',
         agencyContactName,

@@ -1,69 +1,74 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/**
+ * Plan a batch of social-media image concepts for a client. Persists each
+ * concept (and any carousel slides) into image_batch_items so the
+ * downstream generate-batch-image function can render them.
+ *
+ * Contract preserved:
+ *   Request:  { sessionId?, clientId, referenceStyle?, referenceImages?, count? = 30 }
+ *   Response: { success, concepts, count }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { notFound, upstream } from '../_shared/errors.ts';
+import { ensureNumber, ensureOptionalArray, ensureOptionalString, ensureOptionalUuid, ensureUuid } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireClientAccess } from '../_shared/auth.ts';
+import { callGemini } from '../_shared/gemini.ts';
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
+interface CarouselSlide { slideNumber?: number; description?: string; textOverlay?: string }
+interface Concept {
+  sequence?: number;
+  concept: string;
+  textOverlay?: string;
+  templateType: string;
+  platform?: string;
+  caption?: string;
+  hashtags?: string[];
+  slides?: CarouselSlide[];
+}
 
-  try {
-    const { sessionId, clientId, referenceStyle, referenceImages, count = 30 } = await req.json();
-    
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const lovableApiKey = Deno.env.get('GOOGLE_AI_API_KEY');
+interface RequestBody {
+  sessionId?: unknown;
+  clientId: unknown;
+  referenceStyle?: unknown;
+  referenceImages?: unknown;
+  count?: unknown;
+}
 
-    if (!lovableApiKey) {
-      throw new Error('GOOGLE_AI_API_KEY is not configured');
-    }
+Deno.serve(withErrorHandling({ fn: 'generate-image-batch-plan' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const sessionId = ensureOptionalUuid('sessionId', body.sessionId);
+  const clientId = ensureUuid('clientId', body.clientId);
+  const referenceStyle = ensureOptionalString('referenceStyle', body.referenceStyle, 5_000);
+  const referenceImages = ensureOptionalArray('referenceImages', body.referenceImages, () => undefined, { max: 50 });
+  const count = body.count === undefined ? 30 : ensureNumber('count', body.count, { integer: true, min: 1, max: 100 });
 
-    const supabase = createClient(supabaseUrl, supabaseKey);
+  await requireClientAccess(req, clientId);
 
-    // Fetch client info
-    const { data: client } = await supabase
-      .from('clients')
-      .select('*')
-      .eq('id', clientId)
-      .single();
+  const supabase = getSupabaseAdmin();
+  const { data: client } = await supabase.from('clients').select('*').eq('id', clientId).maybeSingle();
+  if (!client) throw notFound('Client not found');
 
-    if (!client) {
-      throw new Error('Client not found');
-    }
+  const [{ data: knowledgeEntries }, { data: knowledgeSummary }] = await Promise.all([
+    supabase.from('knowledge_entries').select('*').eq('client_id', clientId),
+    supabase.from('knowledge_summary').select('*').eq('client_id', clientId).maybeSingle(),
+  ]);
 
-    // Fetch knowledge base
-    const { data: knowledgeEntries } = await supabase
-      .from('knowledge_entries')
-      .select('*')
-      .eq('client_id', clientId);
-
-    const { data: knowledgeSummary } = await supabase
-      .from('knowledge_summary')
-      .select('*')
-      .eq('client_id', clientId)
-      .single();
-
-    const knowledgeContext = knowledgeEntries?.map(entry => 
-      `[${entry.category.toUpperCase()}] ${entry.title}: ${entry.content}`
-    ).join('\n\n') || 'No knowledge base available.';
-
-    const summaryContext = knowledgeSummary ? `
-Brand Positioning: ${knowledgeSummary.positioning_summary || 'Not defined'}
-Key Differentiators: ${knowledgeSummary.key_differentiators?.join(', ') || 'Not defined'}
-Ideal Customer: ${knowledgeSummary.ideal_customer_profile || 'Not defined'}
+  const knowledgeContext = (knowledgeEntries ?? [])
+    .map((entry) => `[${(entry.category as string).toUpperCase()}] ${entry.title}: ${entry.content}`)
+    .join('\n\n') || 'No knowledge base available.';
+  const summaryContext = knowledgeSummary ? `
+Brand Positioning: ${knowledgeSummary.positioning_summary ?? 'Not defined'}
+Key Differentiators: ${(knowledgeSummary.key_differentiators ?? []).join(', ') || 'Not defined'}
+Ideal Customer: ${knowledgeSummary.ideal_customer_profile ?? 'Not defined'}
 ` : '';
 
-    // Build reference images context
-    const hasReferenceImages = referenceImages && referenceImages.length > 0;
-    const referenceContext = hasReferenceImages 
-      ? `\n\nREFERENCE IMAGES PROVIDED: ${referenceImages.length} style reference image(s) have been uploaded. The image generation step will use these for visual style guidance.`
-      : '';
+  const hasReferenceImages = (referenceImages?.length ?? 0) > 0;
+  const referenceContext = hasReferenceImages
+    ? `\n\nREFERENCE IMAGES PROVIDED: ${referenceImages?.length} style reference image(s) have been uploaded. The image generation step will use these for visual style guidance.`
+    : '';
 
-const systemPrompt = `You are a creative director generating social media content ideas. Your job is to create ${count} simple, clear content concepts that describe WHAT to post, not HOW it should look visually.
+  const systemPrompt = `You are a creative director generating social media content ideas. Your job is to create ${count} simple, clear content concepts that describe WHAT to post, not HOW it should look visually.
 
 ${hasReferenceImages ? `
 ⚠️ IMPORTANT: Reference images have been provided for visual style guidance.
@@ -130,7 +135,7 @@ CONCEPT GUIDELINES:
 
 No markdown formatting, just the JSON array.`;
 
-    const userPrompt = `Create ${count} simple content concepts for:
+  const userPrompt = `Create ${count} simple content concepts for:
 
 BUSINESS: ${client.business_name}
 INDUSTRY: ${client.industry}
@@ -145,151 +150,80 @@ ${referenceStyle ? `\nADDITIONAL NOTES: ${referenceStyle}` : ''}
 
 Remember: Keep concepts simple and readable. Describe WHAT to create, not HOW it should look visually.${hasReferenceImages ? ' The reference images will handle the visual style.' : ''}`;
 
-    console.log('Generating enhanced image batch plan...');
+  const { text } = await callGemini({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    maxTokens: 8_192,
+  });
 
-    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${lovableApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gemini-2.5-flash',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-      }),
-    });
+  let cleaned = text.trim();
+  if (cleaned.startsWith('```json')) cleaned = cleaned.replace(/^```json\n?/, '').replace(/\n?```$/, '');
+  else if (cleaned.startsWith('```')) cleaned = cleaned.replace(/^```\n?/, '').replace(/\n?```$/, '');
 
-    if (!response.ok) {
-      if (response.status === 429) {
-        return new Response(
-          JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }),
-          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      if (response.status === 402) {
-        return new Response(
-          JSON.stringify({ error: 'API credits exhausted. Please add funds.' }),
-          { status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      throw new Error('AI request failed');
-    }
+  let concepts: Concept[];
+  try {
+    concepts = JSON.parse(cleaned);
+    if (!Array.isArray(concepts)) throw new Error('not an array');
+  } catch (err) {
+    log.error('parse_failed', err, { head: cleaned.slice(0, 300) });
+    throw upstream('Failed to parse content concepts');
+  }
 
-    const aiResponse = await response.json();
-    let content = aiResponse.choices?.[0]?.message?.content;
+  if (sessionId) {
+    const insertItems: Array<Record<string, unknown>> = [];
+    let sequenceNumber = 0;
 
-    if (!content) {
-      throw new Error('No response from AI');
-    }
-
-    // Clean and parse JSON
-    content = content.trim();
-    if (content.startsWith('```json')) {
-      content = content.replace(/^```json\n?/, '').replace(/\n?```$/, '');
-    } else if (content.startsWith('```')) {
-      content = content.replace(/^```\n?/, '').replace(/\n?```$/, '');
-    }
-
-    let concepts;
-    try {
-      concepts = JSON.parse(content);
-    } catch (e) {
-      console.error('Failed to parse AI response:', content);
-      throw new Error('Failed to parse content concepts');
-    }
-
-    // Insert batch items into database with simplified concept data
-    // Handle carousel posts by creating multiple linked items
-    if (sessionId) {
-      const insertItems: any[] = [];
-      let sequenceNumber = 0;
-
-      for (const concept of concepts) {
-        sequenceNumber++;
-        
-        // Check if this is a carousel with slides
-        if (concept.templateType === 'tip_carousel' && concept.slides && Array.isArray(concept.slides) && concept.slides.length >= 3) {
-          // Generate a carousel group ID to link all slides
-          const carouselGroupId = crypto.randomUUID();
-          
-          console.log(`Creating carousel with ${concept.slides.length} slides, group: ${carouselGroupId}`);
-          
-          // Create an item for each slide in the carousel
-          for (let slideIndex = 0; slideIndex < concept.slides.length; slideIndex++) {
-            const slide = concept.slides[slideIndex];
-            insertItems.push({
-              session_id: sessionId,
-              sequence_number: (sequenceNumber * 1000) + slideIndex, // e.g., 5000, 5001, 5002 (integers only)
-              concept: JSON.stringify({
-                description: slide.description || `Carousel slide ${slideIndex + 1}: ${concept.concept}`,
-                textOverlay: slide.textOverlay || concept.textOverlay,
-                caption: concept.caption,
-                hashtags: concept.hashtags,
-                slideNumber: slideIndex + 1,
-                totalSlides: concept.slides.length,
-                carouselTitle: concept.concept
-              }),
-              template_type: concept.templateType,
-              platform: concept.platform,
-              status: 'pending',
-              carousel_group_id: carouselGroupId
-            });
-          }
-        } else {
-          // Non-carousel item - insert as normal
+    for (const concept of concepts) {
+      sequenceNumber++;
+      if (concept.templateType === 'tip_carousel' && Array.isArray(concept.slides) && concept.slides.length >= 3) {
+        const carouselGroupId = crypto.randomUUID();
+        log.info('carousel_assembled', { slides: concept.slides.length, group: carouselGroupId });
+        for (let slideIndex = 0; slideIndex < concept.slides.length; slideIndex++) {
+          const slide = concept.slides[slideIndex];
           insertItems.push({
             session_id: sessionId,
-            sequence_number: sequenceNumber * 1000, // e.g., 5000 (integers only)
+            sequence_number: sequenceNumber * 1000 + slideIndex,
             concept: JSON.stringify({
-              description: concept.concept,
-              textOverlay: concept.textOverlay,
+              description: slide.description ?? `Carousel slide ${slideIndex + 1}: ${concept.concept}`,
+              textOverlay: slide.textOverlay ?? concept.textOverlay,
               caption: concept.caption,
-              hashtags: concept.hashtags
+              hashtags: concept.hashtags,
+              slideNumber: slideIndex + 1,
+              totalSlides: concept.slides.length,
+              carouselTitle: concept.concept,
             }),
             template_type: concept.templateType,
             platform: concept.platform,
             status: 'pending',
-            carousel_group_id: null
+            carousel_group_id: carouselGroupId,
           });
         }
+      } else {
+        insertItems.push({
+          session_id: sessionId,
+          sequence_number: sequenceNumber * 1000,
+          concept: JSON.stringify({
+            description: concept.concept,
+            textOverlay: concept.textOverlay,
+            caption: concept.caption,
+            hashtags: concept.hashtags,
+          }),
+          template_type: concept.templateType,
+          platform: concept.platform,
+          status: 'pending',
+          carousel_group_id: null,
+        });
       }
-
-      // Insert all items
-      const { error: insertError } = await supabase
-        .from('image_batch_items')
-        .insert(insertItems);
-
-      if (insertError) {
-        console.error('Failed to insert batch items:', insertError);
-        throw new Error('Failed to save concepts to database');
-      }
-
-      console.log(`Inserted ${insertItems.length} batch items (includes carousel slides)`);
-
-      // Update session with concepts
-      await supabase
-        .from('ai_sessions')
-        .update({
-          session_data: { concepts, generatedAt: new Date().toISOString() }
-        })
-        .eq('id', sessionId);
     }
 
-    console.log(`Generated ${concepts.length} enhanced image concepts`);
-
-    return new Response(
-      JSON.stringify({ success: true, concepts, count: concepts.length }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-
-  } catch (error) {
-    console.error('Error in generate-image-batch-plan:', error);
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    const { error } = await supabase.from('image_batch_items').insert(insertItems);
+    if (error) throw new Error(error.message);
+    await supabase.from('ai_sessions').update({ session_data: { concepts, generatedAt: new Date().toISOString() } }).eq('id', sessionId);
+    log.info('batch_items_persisted', { count: insertItems.length });
   }
-});
+
+  log.info('plan_generated', { count: concepts.length });
+  return jsonResponse({ success: true, concepts, count: concepts.length });
+}));
