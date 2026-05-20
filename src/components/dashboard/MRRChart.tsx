@@ -27,7 +27,7 @@ export function MRRChart() {
       const endOfMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0);
       const monthMRR = clients
         .filter(c => {
-          if ((c as any).is_personal) return false;
+          if ((c as { is_personal?: boolean }).is_personal) return false;
           if (c.status !== 'active' && c.status !== 'onboarding') return false;
           // If no contract_start, include the client
           if (!c.contract_start) return true;

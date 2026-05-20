@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useParams, Navigate, Link } from 'react-router-dom';
-import { LayoutDashboard, Brain, FileText, FolderOpen, Megaphone, Target, FileDown, Lightbulb, Video, Palette, FileSignature, Link2, Clock } from 'lucide-react';
+import { LayoutDashboard, Brain, FileText, FolderOpen, Megaphone, Target, FileDown, Lightbulb, Video, Palette, FileSignature, Link2, Clock, Package } from 'lucide-react';
 import { useClient } from '@/hooks/useClients';
 import { ClientHeader } from '@/components/client-detail/ClientHeader';
 import { KnowledgeBase } from '@/components/client-detail/KnowledgeBase';
@@ -13,6 +13,7 @@ import { FilmingDayBanner } from '@/components/filming/FilmingDayBanner';
 import { FilmingDayTab } from '@/components/client-detail/FilmingDayTab';
 import { CreativeConceptsTab } from '@/components/client-detail/CreativeConceptsTab';
 import { BrandTab } from '@/components/client-detail/BrandTab';
+import { BrandPackTab } from '@/components/brand-pack/BrandPackTab';
 import { ContractsTab } from '@/components/client-detail/ContractsTab';
 import { ShareLinksTab } from '@/components/client-detail/ShareLinksTab';
 import { LateSettingsTab } from '@/components/client-detail/LateSettingsTab';
@@ -23,6 +24,7 @@ import { cn } from '@/lib/utils';
 const tabs = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'brand', label: 'Brand', icon: Palette },
+  { id: 'brand-pack', label: 'Brand Pack', icon: Package },
   { id: 'filming', label: 'Filming Day', icon: Video },
   { id: 'creatives', label: 'Creatives', icon: Lightbulb },
   { id: 'knowledge', label: 'Knowledge', icon: Brain },
@@ -138,6 +140,8 @@ export default function ClientDetail() {
         );
       case 'brand':
         return <BrandTab client={client} />;
+      case 'brand-pack':
+        return <BrandPackTab clientId={client.id} />;
       case 'filming':
         return <FilmingDayTab clientId={client.id} />;
       case 'creatives':

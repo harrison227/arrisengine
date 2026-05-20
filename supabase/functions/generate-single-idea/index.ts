@@ -1,24 +1,18 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+/**
+ * Generate or refine a single content idea via Gemini.
+ *
+ * Contract preserved:
+ *   Request:  { prompt, clientContext?, existingIdea? }
+ *   Response: { idea: { hook, script, platform[], formatType, duration, shotList[], audioSuggestion } }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { upstream } from '../_shared/errors.ts';
+import { ensureNonEmptyString, ensureOptionalString, ensureRecord } from '../_shared/validation.ts';
+import { requireUser } from '../_shared/auth.ts';
+import { callGemini } from '../_shared/gemini.ts';
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
-
-  try {
-    const { prompt, clientContext, existingIdea } = await req.json();
-
-    const GOOGLE_AI_API_KEY = Deno.env.get("GOOGLE_AI_API_KEY");
-    if (!GOOGLE_AI_API_KEY) {
-      throw new Error("GOOGLE_AI_API_KEY is not configured");
-    }
-
-    let systemPrompt = `You are a flexible content strategist. Generate a single content idea based on the user's prompt.
+const SYSTEM_PROMPT_BASE = `You are a flexible content strategist. Generate a single content idea based on the user's prompt.
 
 IMPORTANT: Match the TONE and STYLE the user requests. Not all content needs to be punchy or viral-style.
 - If they want a testimonial, make it authentic and conversational
@@ -51,111 +45,69 @@ Guidelines:
 - shotList: 2-5 specific visual shots appropriate for the format
 - audioSuggestion: Background music, trending audio, or voiceover style if relevant`;
 
-    if (clientContext) {
-      systemPrompt += `\n\nClient Context:\n${clientContext}`;
-    }
+interface RequestBody { prompt: unknown; clientContext?: unknown; existingIdea?: unknown }
 
-    let userPrompt = prompt;
-    if (existingIdea) {
-      userPrompt = `Modify this content idea based on the user's guidance: "${prompt}"
-      
+Deno.serve(withErrorHandling({ fn: 'generate-single-idea' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const promptText = ensureNonEmptyString('prompt', body.prompt, 5_000);
+  const clientContext = ensureOptionalString('clientContext', body.clientContext, 50_000);
+  const existingIdea = body.existingIdea ? ensureRecord('existingIdea', body.existingIdea) : undefined;
+
+  // No clientId on this endpoint — clientContext is supplied by the caller —
+  // so we just gate on a logged-in user to prevent anon credit burn.
+  await requireUser(req);
+
+  let systemPrompt = SYSTEM_PROMPT_BASE;
+  if (clientContext) systemPrompt += `\n\nClient Context:\n${clientContext}`;
+
+  let userPrompt = promptText;
+  if (existingIdea) {
+    const platforms = Array.isArray(existingIdea.platform)
+      ? (existingIdea.platform as unknown[]).join(', ')
+      : String(existingIdea.platform ?? '');
+    userPrompt = `Modify this content idea based on the user's guidance: "${promptText}"
+
 Current idea:
-- Hook: ${existingIdea.hook}
-- Script: ${existingIdea.script || 'None'}
-- Platform: ${Array.isArray(existingIdea.platform) ? existingIdea.platform.join(', ') : existingIdea.platform}
-- Format: ${existingIdea.formatType}
+- Hook: ${existingIdea.hook ?? ''}
+- Script: ${existingIdea.script ?? 'None'}
+- Platform: ${platforms}
+- Format: ${existingIdea.formatType ?? ''}
 
-IMPORTANT: Follow the user's guidance closely. If they provide a specific script or style, use it. 
+IMPORTANT: Follow the user's guidance closely. If they provide a specific script or style, use it.
 Do NOT automatically make it "more punchy" or "more viral" unless specifically asked.`;
-    }
-
-    console.log('Generating single idea with prompt:', userPrompt.substring(0, 100));
-
-    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GOOGLE_AI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gemini-2.5-flash",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt }
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("AI gateway error:", response.status, errorText);
-      
-      if (response.status === 429) {
-        return new Response(JSON.stringify({ error: "Rate limit exceeded. Please try again in a moment." }), {
-          status: 429,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      if (response.status === 402) {
-        return new Response(JSON.stringify({ error: "AI credits depleted. Please add credits to continue." }), {
-          status: 402,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      
-      throw new Error(`AI gateway error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-
-    if (!content) {
-      throw new Error("No content returned from AI");
-    }
-
-    // Parse the JSON response - handle possible markdown code blocks
-    let cleanedContent = content.trim();
-    if (cleanedContent.startsWith('```json')) {
-      cleanedContent = cleanedContent.slice(7);
-    } else if (cleanedContent.startsWith('```')) {
-      cleanedContent = cleanedContent.slice(3);
-    }
-    if (cleanedContent.endsWith('```')) {
-      cleanedContent = cleanedContent.slice(0, -3);
-    }
-    cleanedContent = cleanedContent.trim();
-
-    let idea;
-    try {
-      idea = JSON.parse(cleanedContent);
-    } catch (parseError) {
-      console.error("Failed to parse AI response:", cleanedContent);
-      throw new Error("Failed to parse AI response as JSON");
-    }
-
-    // Validate and ensure required fields
-    const validatedIdea = {
-      hook: idea.hook || "Generated content idea",
-      script: idea.script || "",
-      platform: Array.isArray(idea.platform) ? idea.platform : [idea.platform || "Instagram"],
-      formatType: idea.formatType || "Talking Head",
-      duration: idea.duration || 60,
-      shotList: Array.isArray(idea.shotList) ? idea.shotList : [],
-      audioSuggestion: idea.audioSuggestion || "",
-    };
-
-    console.log('Generated idea:', validatedIdea.hook);
-
-    return new Response(JSON.stringify({ idea: validatedIdea }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
-
-  } catch (error: unknown) {
-    console.error("Error in generate-single-idea:", error);
-    const errorMessage = error instanceof Error ? error.message : "Failed to generate idea";
-    return new Response(JSON.stringify({ error: errorMessage }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
   }
-});
+
+  const { text } = await callGemini({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+  });
+
+  const cleaned = text.trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/, '')
+    .trim();
+
+  let idea: Record<string, unknown>;
+  try {
+    idea = JSON.parse(cleaned);
+  } catch (err) {
+    log.error('parse_failed', err, { head: cleaned.slice(0, 200) });
+    throw upstream('Failed to parse AI response as JSON');
+  }
+
+  const validated = {
+    hook: typeof idea.hook === 'string' && idea.hook ? idea.hook : 'Generated content idea',
+    script: typeof idea.script === 'string' ? idea.script : '',
+    platform: Array.isArray(idea.platform) ? idea.platform : [idea.platform || 'Instagram'],
+    formatType: typeof idea.formatType === 'string' ? idea.formatType : 'Talking Head',
+    duration: typeof idea.duration === 'number' ? idea.duration : 60,
+    shotList: Array.isArray(idea.shotList) ? idea.shotList : [],
+    audioSuggestion: typeof idea.audioSuggestion === 'string' ? idea.audioSuggestion : '',
+  };
+
+  log.info('idea_generated', { hook: validated.hook });
+  return jsonResponse({ idea: validated });
+}));

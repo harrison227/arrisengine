@@ -46,7 +46,7 @@ export function ClientCard({ client }: ClientCardProps) {
             <h3 className="text-lg font-semibold text-foreground group-hover:text-primary transition-colors">
               {client.business_name}
             </h3>
-            {(client as any).is_personal && (
+            {(client as { is_personal?: boolean }).is_personal && (
               <Badge variant="outline" className="text-xs border-muted-foreground/30 text-muted-foreground">
                 Personal
               </Badge>

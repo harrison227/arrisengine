@@ -1,418 +1,318 @@
-import "https://deno.land/x/xhr@0.1.0/mod.ts";
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/**
+ * Public analytics fetcher backing the shared analytics dashboard.
+ *
+ * Talks to Late.is on the client's behalf using the per-client API key.
+ * Aggregates follower stats, post analytics, and per-platform breakdowns
+ * into a single response.
+ *
+ * Contract preserved:
+ *   Request:  { shareId, fromDate?, toDate? }
+ *   Response: { client, accounts, followerStats, postAnalytics,
+ *               aggregatedMetrics, platformBreakdown, topPosts, ... }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { badRequest, notFound, forbidden } from '../_shared/errors.ts';
+import { ensureNonEmptyString, ensureOptionalString } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { LateClient } from '../_shared/late.ts';
+import type { Logger } from '../_shared/logger.ts';
+
+interface RequestBody {
+  shareId: unknown;
+  fromDate?: unknown;
+  toDate?: unknown;
+}
+
+type Account = Record<string, unknown> & { id: string; platform?: string; provider?: string; username?: string; handle?: string };
+
+interface PostMetric {
+  id: string;
+  caption: string;
+  posted_at: string | null;
+  platform: string;
+  accountId: string;
+  username: string;
+  impressions: number;
+  views: number;
+  reach: number;
+  likes: number;
+  comments: number;
+  shares: number;
+  saves: number;
+  clicks: number;
+  engagement: number;
+  engagementRate: number;
+  thumbnailUrl: string | null;
+}
+
+interface FollowerStat {
+  accountId: string;
+  platform: string;
+  username: string;
+  current_followers: number;
+  follower_history: Array<{ date: string; count: number }>;
+}
+
+const num = (...candidates: unknown[]): number => {
+  for (const c of candidates) {
+    if (typeof c === 'number' && Number.isFinite(c)) return c;
+  }
+  return 0;
 };
 
-const LATE_API_BASE = 'https://getlate.dev/api/v1';
+const str = (...candidates: unknown[]): string => {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return '';
+};
 
-serve(async (req) => {
-  // Handle CORS preflight requests
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
+Deno.serve(withErrorHandling({ fn: 'public-analytics-fetch' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const shareId = ensureNonEmptyString('shareId', body.shareId, 200);
+  const fromDate = ensureOptionalString('fromDate', body.fromDate, 100);
+  const toDate = ensureOptionalString('toDate', body.toDate, 100);
+
+  const supabase = getSupabaseAdmin();
+
+  // Resolve share link.
+  const { data: shareLink } = await supabase
+    .from('analytics_share_links')
+    .select('*')
+    .eq('share_id', shareId)
+    .eq('is_active', true)
+    .maybeSingle();
+  if (!shareLink) throw notFound('Invalid or expired share link');
+  if (shareLink.expires_at && new Date(shareLink.expires_at) < new Date()) {
+    throw forbidden('Share link has expired');
   }
 
-  try {
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+  // Resolve client + Late credentials.
+  const { data: client } = await supabase
+    .from('clients')
+    .select('id, business_name, brand_logo_url, brand_primary_color, late_api_key, late_profile_id')
+    .eq('id', shareLink.client_id)
+    .maybeSingle();
+  if (!client) throw notFound('Client not found');
+  if (!client.late_api_key) throw badRequest('Late not connected for this client');
 
-    const { shareId, fromDate, toDate } = await req.json();
+  const late = new LateClient(client.late_api_key);
+  const effectiveFromDate = fromDate ?? shareLink.date_range_start;
+  const effectiveToDate = toDate ?? shareLink.date_range_end;
 
-    if (!shareId) {
-      return new Response(
-        JSON.stringify({ error: 'Share ID is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+  const accountsBundle = await fetchAccounts({ late, profileId: client.late_profile_id, log });
+  let { accounts } = accountsBundle;
+  const { hasAnalyticsAccess } = accountsBundle;
 
-    console.log(`Fetching public analytics for shareId: ${shareId}`);
-
-    // Get share link details
-    const { data: shareLink, error: shareLinkError } = await supabase
-      .from('analytics_share_links')
-      .select('*')
-      .eq('share_id', shareId)
-      .eq('is_active', true)
-      .single();
-
-    if (shareLinkError || !shareLink) {
-      console.error('Error fetching share link:', shareLinkError);
-      return new Response(
-        JSON.stringify({ error: 'Invalid or expired share link' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Check if expired
-    if (shareLink.expires_at && new Date(shareLink.expires_at) < new Date()) {
-      return new Response(
-        JSON.stringify({ error: 'Share link has expired' }),
-        { status: 410, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Get client details
-    const { data: client, error: clientError } = await supabase
-      .from('clients')
-      .select('id, business_name, brand_logo_url, brand_primary_color, late_api_key, late_profile_id')
-      .eq('id', shareLink.client_id)
-      .single();
-
-    if (clientError || !client) {
-      console.error('Error fetching client:', clientError);
-      return new Response(
-        JSON.stringify({ error: 'Client not found' }),
-        { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    if (!client.late_api_key) {
-      return new Response(
-        JSON.stringify({ error: 'Late not connected for this client' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const lateHeaders = {
-      'Authorization': `Bearer ${client.late_api_key}`,
-      'Content-Type': 'application/json',
-    };
-
-    // Use date range from share link if not overridden
-    const effectiveFromDate = fromDate || shareLink.date_range_start;
-    const effectiveToDate = toDate || shareLink.date_range_end;
-
-    // Fetch connected accounts with profileId
-    console.log('Fetching connected accounts...');
-    let accounts = [];
-    let hasAnalyticsAccess = false;
-    
-    try {
-      const accountsUrl = client.late_profile_id 
-        ? `${LATE_API_BASE}/accounts?profileId=${client.late_profile_id}`
-        : `${LATE_API_BASE}/accounts`;
-      
-      console.log(`Accounts URL: ${accountsUrl}`);
-      
-      const accountsResponse = await fetch(accountsUrl, {
-        headers: lateHeaders,
-      });
-
-      if (accountsResponse.ok) {
-        const accountsData = await accountsResponse.json();
-        console.log('Accounts response:', JSON.stringify(accountsData, null, 2));
-        
-        // Late returns { accounts: [...], hasAnalyticsAccess: boolean }
-        accounts = accountsData.accounts || accountsData.data || [];
-        hasAnalyticsAccess = accountsData.hasAnalyticsAccess ?? false;
-        
-        // Normalize account IDs
-        accounts = accounts.map((acc: any) => ({
-          ...acc,
-          id: acc._id || acc.id,
-        }));
-        
-        console.log(`Found ${accounts.length} accounts`);
-      } else {
-        console.error('Failed to fetch accounts:', accountsResponse.status);
-      }
-    } catch (fetchError) {
-      console.error('Error fetching accounts:', fetchError);
-    }
-
-    // Filter by platforms if specified in share link
-    if (shareLink.platforms && shareLink.platforms.length > 0) {
-      accounts = accounts.filter((acc: any) => 
-        shareLink.platforms.includes(acc.platform || acc.provider)
-      );
-    }
-
-    if (accounts.length === 0) {
-      return new Response(
-        JSON.stringify({ 
-          client: { 
-            name: client.business_name, 
-            logoUrl: client.brand_logo_url,
-            primaryColor: client.brand_primary_color,
-          },
-          accounts: [],
-          followerStats: [],
-          postAnalytics: [],
-          aggregatedMetrics: {
-            totalFollowers: 0,
-            totalPosts: 0,
-            totalImpressions: 0,
-            totalReach: 0,
-            totalLikes: 0,
-            totalComments: 0,
-            totalShares: 0,
-            totalClicks: 0,
-            averageEngagementRate: 0,
-          },
-          platformBreakdown: [],
-          topPosts: [],
-          hasAnalyticsAccess,
-          noAccountsFound: true,
-          dateRange: { from: effectiveFromDate, to: effectiveToDate },
-          fetchedAt: new Date().toISOString(),
-        }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Get account IDs for batch requests
-    const accountIds = accounts.map((acc: any) => acc.id).join(',');
-
-    // Fetch follower stats
-    let followerStats: any[] = [];
-    let analyticsNotEnabled = false;
-    
-    try {
-      const followerParams = new URLSearchParams();
-      if (client.late_profile_id) {
-        followerParams.append('profileId', client.late_profile_id);
-      }
-      followerParams.append('accountIds', accountIds);
-      if (effectiveFromDate) {
-        followerParams.append('fromDate', effectiveFromDate);
-      }
-      if (effectiveToDate) {
-        followerParams.append('toDate', effectiveToDate);
-      }
-      followerParams.append('granularity', 'daily');
-      
-      const followerUrl = `${LATE_API_BASE}/accounts/follower-stats?${followerParams}`;
-      console.log(`Fetching follower stats from: ${followerUrl}`);
-      
-      const followerResponse = await fetch(followerUrl, {
-        headers: lateHeaders,
-      });
-      
-      if (followerResponse.ok) {
-        const followerData = await followerResponse.json();
-        console.log('Follower stats response:', JSON.stringify(followerData, null, 2));
-        
-        const currentFollowers = followerData.currentFollowers || {};
-        const statsData = followerData.stats || {};
-        
-        followerStats = accounts.map((account: any) => {
-          const accId = account.id;
-          const history = statsData[accId] || [];
-          
-          return {
-            accountId: accId,
-            platform: account.platform || account.provider,
-            username: account.username || account.handle,
-            current_followers: currentFollowers[accId] || account.followersCount || 0,
-            follower_history: history.map((h: any) => ({
-              date: h.date,
-              count: h.followers || h.count,
-            })),
-          };
-        });
-      } else if (followerResponse.status === 403) {
-        console.log('Analytics add-on not enabled');
-        analyticsNotEnabled = true;
-      } else {
-        console.error('Follower stats error:', followerResponse.status);
-      }
-    } catch (followerError) {
-      console.error('Error fetching follower stats:', followerError);
-    }
-
-    // Build basic stats if no API response
-    if (followerStats.length === 0 && !analyticsNotEnabled) {
-      followerStats = accounts.map((account: any) => ({
-        accountId: account.id,
-        platform: account.platform || account.provider,
-        username: account.username || account.handle,
-        current_followers: account.followersCount || account.followers || 0,
-        follower_history: [],
-      }));
-    }
-
-    // Fetch post analytics using unified endpoint
-    let postAnalytics: any[] = [];
-    
-    try {
-      const analyticsParams = new URLSearchParams();
-      if (client.late_profile_id) {
-        analyticsParams.append('profileId', client.late_profile_id);
-      }
-      analyticsParams.append('platform', 'all');
-      if (effectiveFromDate) {
-        analyticsParams.append('fromDate', effectiveFromDate);
-      }
-      if (effectiveToDate) {
-        analyticsParams.append('toDate', effectiveToDate);
-      }
-      analyticsParams.append('limit', '50');
-      analyticsParams.append('page', '1');
-      analyticsParams.append('sortBy', 'engagement');
-      analyticsParams.append('order', 'desc');
-      
-      const analyticsUrl = `${LATE_API_BASE}/analytics?${analyticsParams}`;
-      console.log(`Fetching analytics from: ${analyticsUrl}`);
-      
-      const analyticsResponse = await fetch(analyticsUrl, {
-        headers: lateHeaders,
-      });
-      
-      if (analyticsResponse.ok) {
-        const analyticsData = await analyticsResponse.json();
-        console.log('Analytics response:', JSON.stringify(analyticsData, null, 2));
-        
-        const posts = analyticsData.posts || analyticsData.data || analyticsData || [];
-        
-        postAnalytics = (Array.isArray(posts) ? posts : []).map((post: any) => {
-          // Late may nest metrics under analytics object
-          const analytics = post.analytics || {};
-          
-          // Get views/impressions from multiple possible locations
-          const views = post.views || analytics.views || post.impressions || analytics.impressions || 0;
-          const reach = post.reach || analytics.reach || 0;
-          const likes = post.likes || analytics.likes || post.likeCount || analytics.likeCount || 0;
-          const comments = post.comments || analytics.comments || post.commentCount || analytics.commentCount || 0;
-          const shares = post.shares || analytics.shares || post.retweets || analytics.retweets || post.reposts || analytics.reposts || 0;
-          const saves = post.saves || analytics.saves || post.bookmarks || analytics.bookmarks || 0;
-          const clicks = post.clicks || analytics.clicks || post.linkClicks || analytics.linkClicks || 0;
-          
-          return {
-            id: post._id || post.id || post.postId,
-            caption: post.caption || post.content || post.text || '',
-            posted_at: post.publishedAt || post.postedAt || post.createdAt,
-            platform: post.platform || post.provider,
-            accountId: post.accountId || post.account_id,
-            username: post.username || '',
-            impressions: views,
-            views: views,
-            reach: reach,
-            likes: likes,
-            comments: comments,
-            shares: shares,
-            saves: saves,
-            clicks: clicks,
-            engagement: post.engagement || analytics.engagement || (likes + comments + shares + saves),
-            engagementRate: post.engagementRate || analytics.engagementRate || 0,
-            thumbnailUrl: post.thumbnailUrl || post.mediaUrl || post.imageUrl,
-          };
-        });
-      } else if (analyticsResponse.status === 403) {
-        analyticsNotEnabled = true;
-      } else {
-        console.error('Analytics error:', analyticsResponse.status);
-      }
-    } catch (analyticsError) {
-      console.error('Error fetching analytics:', analyticsError);
-    }
-
-    // Calculate aggregate metrics
-    const aggregatedMetrics = {
-      totalFollowers: 0,
-      totalPosts: postAnalytics.length,
-      totalImpressions: 0,
-      totalReach: 0,
-      totalLikes: 0,
-      totalComments: 0,
-      totalShares: 0,
-      totalClicks: 0,
-      averageEngagementRate: 0,
-    };
-
-    const platformBreakdown: Record<string, any> = {};
-
-    followerStats.forEach((stat: any) => {
-      const followers = stat.current_followers || 0;
-      aggregatedMetrics.totalFollowers += followers;
-      
-      const plat = stat.platform || 'unknown';
-      if (!platformBreakdown[plat]) {
-        platformBreakdown[plat] = {
-          platform: plat,
-          followers: 0,
-          impressions: 0,
-          engagement: 0,
-          posts: 0,
-        };
-      }
-      platformBreakdown[plat].followers += followers;
-    });
-
-    postAnalytics.forEach((post: any) => {
-      aggregatedMetrics.totalImpressions += post.impressions || 0;
-      aggregatedMetrics.totalReach += post.reach || 0;
-      aggregatedMetrics.totalLikes += post.likes || 0;
-      aggregatedMetrics.totalComments += post.comments || 0;
-      aggregatedMetrics.totalShares += post.shares || 0;
-      aggregatedMetrics.totalClicks += post.clicks || 0;
-
-      const plat = post.platform || 'unknown';
-      if (!platformBreakdown[plat]) {
-        platformBreakdown[plat] = {
-          platform: plat,
-          followers: 0,
-          impressions: 0,
-          engagement: 0,
-          posts: 0,
-        };
-      }
-      platformBreakdown[plat].impressions += post.impressions || 0;
-      platformBreakdown[plat].engagement += post.engagement || 0;
-      platformBreakdown[plat].posts++;
-    });
-
-    if (aggregatedMetrics.totalImpressions > 0) {
-      const totalEngagements = aggregatedMetrics.totalLikes + aggregatedMetrics.totalComments + aggregatedMetrics.totalShares;
-      aggregatedMetrics.averageEngagementRate = (totalEngagements / aggregatedMetrics.totalImpressions) * 100;
-    }
-
-    const topPosts = [...postAnalytics]
-      .sort((a, b) => (b.engagement || 0) - (a.engagement || 0))
-      .slice(0, 12);
-
-    const response = {
-      client: {
-        name: client.business_name,
-        logoUrl: client.brand_logo_url,
-        primaryColor: client.brand_primary_color,
-      },
-      accounts: accounts.map((acc: any) => ({
-        id: acc.id,
-        platform: acc.platform || acc.provider,
-        username: acc.username || acc.handle,
-        profilePictureUrl: acc.profilePicture || acc.avatarUrl || acc.profile_picture_url,
-        followers: acc.followersCount || acc.followers || 0,
-      })),
-      followerStats,
-      postAnalytics,
-      aggregatedMetrics,
-      platformBreakdown: Object.values(platformBreakdown),
-      topPosts,
-      hasAnalyticsAccess,
-      analyticsNotEnabled,
-      dateRange: {
-        from: effectiveFromDate,
-        to: effectiveToDate,
-      },
-      fetchedAt: new Date().toISOString(),
-    };
-
-    console.log(`Returning public analytics: ${accounts.length} accounts, ${postAnalytics.length} posts`);
-
-    return new Response(
-      JSON.stringify(response),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error: unknown) {
-    console.error('Error in public-analytics-fetch:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    return new Response(
-      JSON.stringify({ error: 'Internal server error', details: errorMessage }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+  if (Array.isArray(shareLink.platforms) && shareLink.platforms.length > 0) {
+    accounts = accounts.filter((a) => (shareLink.platforms as string[]).includes(String(a.platform ?? a.provider ?? '')));
   }
-});
+
+  if (accounts.length === 0) {
+    return jsonResponse(emptyResponse(client, hasAnalyticsAccess, effectiveFromDate, effectiveToDate));
+  }
+
+  const accountIds = accounts.map((a) => a.id).join(',');
+
+  const { followerStats, analyticsNotEnabled: followerAnalyticsBlocked } = await fetchFollowerStats({
+    late, profileId: client.late_profile_id, accountIds, fromDate: effectiveFromDate, toDate: effectiveToDate, accounts, log,
+  });
+
+  const { postAnalytics, analyticsNotEnabled: postAnalyticsBlocked } = await fetchPostAnalytics({
+    late, profileId: client.late_profile_id, fromDate: effectiveFromDate, toDate: effectiveToDate, log,
+  });
+
+  const analyticsNotEnabled = followerAnalyticsBlocked || postAnalyticsBlocked;
+  const aggregated = aggregate(followerStats, postAnalytics);
+  const topPosts = [...postAnalytics].sort((a, b) => b.engagement - a.engagement).slice(0, 12);
+
+  log.info('analytics_assembled', {
+    accounts: accounts.length, posts: postAnalytics.length, hasAnalyticsAccess,
+  });
+
+  return jsonResponse({
+    client: { name: client.business_name, logoUrl: client.brand_logo_url, primaryColor: client.brand_primary_color },
+    accounts: accounts.map((a) => ({
+      id: a.id,
+      platform: str(a.platform, a.provider),
+      username: str(a.username, a.handle),
+      profilePictureUrl: a.profilePicture ?? a.avatarUrl ?? a.profile_picture_url ?? null,
+      followers: num(a.followersCount, a.followers),
+    })),
+    followerStats,
+    postAnalytics,
+    aggregatedMetrics: aggregated.metrics,
+    platformBreakdown: Object.values(aggregated.platformBreakdown),
+    topPosts,
+    hasAnalyticsAccess,
+    analyticsNotEnabled,
+    dateRange: { from: effectiveFromDate, to: effectiveToDate },
+    fetchedAt: new Date().toISOString(),
+  });
+}));
+
+async function fetchAccounts(args: { late: LateClient; profileId: string | null; log: Logger }): Promise<{ accounts: Account[]; hasAnalyticsAccess: boolean }> {
+  const endpoint = args.profileId ? `/accounts?profileId=${encodeURIComponent(args.profileId)}` : '/accounts';
+  const result = await args.late.call<{ accounts?: Account[]; data?: Account[]; hasAnalyticsAccess?: boolean }>({ endpoint, method: 'GET' });
+  if (result.error) {
+    args.log.warn('late_accounts_failed', { error: result.error, status: result.status });
+    return { accounts: [], hasAnalyticsAccess: false };
+  }
+  const raw = result.data?.accounts ?? result.data?.data ?? [];
+  return {
+    accounts: raw.map((a: Record<string, unknown>) => ({ ...(a as Account), id: String(a._id ?? a.id ?? '') })).filter((a) => a.id),
+    hasAnalyticsAccess: Boolean(result.data?.hasAnalyticsAccess),
+  };
+}
+
+interface FollowerArgs { late: LateClient; profileId: string | null; accountIds: string; fromDate: string | null; toDate: string | null; accounts: Account[]; log: Logger }
+async function fetchFollowerStats(args: FollowerArgs): Promise<{ followerStats: FollowerStat[]; analyticsNotEnabled: boolean }> {
+  const params = new URLSearchParams();
+  if (args.profileId) params.append('profileId', args.profileId);
+  params.append('accountIds', args.accountIds);
+  if (args.fromDate) params.append('fromDate', args.fromDate);
+  if (args.toDate) params.append('toDate', args.toDate);
+  params.append('granularity', 'daily');
+  const result = await args.late.call<{ currentFollowers?: Record<string, number>; stats?: Record<string, Array<{ date: string; followers?: number; count?: number }>> }>({
+    endpoint: `/accounts/follower-stats?${params}`, method: 'GET',
+  });
+
+  if (result.error && result.status === 403) return { followerStats: [], analyticsNotEnabled: true };
+  if (result.error) {
+    args.log.warn('late_follower_stats_failed', { error: result.error });
+    return { followerStats: args.accounts.map((a) => baseStat(a)), analyticsNotEnabled: false };
+  }
+  const currentFollowers = result.data?.currentFollowers ?? {};
+  const statsData = result.data?.stats ?? {};
+  return {
+    followerStats: args.accounts.map((a) => ({
+      accountId: a.id,
+      platform: str(a.platform, a.provider),
+      username: str(a.username, a.handle),
+      current_followers: currentFollowers[a.id] ?? num(a.followersCount, a.followers),
+      follower_history: (statsData[a.id] ?? []).map((h) => ({ date: h.date, count: num(h.followers, h.count) })),
+    })),
+    analyticsNotEnabled: false,
+  };
+}
+
+function baseStat(a: Account): FollowerStat {
+  return {
+    accountId: a.id,
+    platform: str(a.platform, a.provider),
+    username: str(a.username, a.handle),
+    current_followers: num(a.followersCount, a.followers),
+    follower_history: [],
+  };
+}
+
+interface PostArgs { late: LateClient; profileId: string | null; fromDate: string | null; toDate: string | null; log: Logger }
+async function fetchPostAnalytics(args: PostArgs): Promise<{ postAnalytics: PostMetric[]; analyticsNotEnabled: boolean }> {
+  const params = new URLSearchParams();
+  if (args.profileId) params.append('profileId', args.profileId);
+  params.append('platform', 'all');
+  if (args.fromDate) params.append('fromDate', args.fromDate);
+  if (args.toDate) params.append('toDate', args.toDate);
+  params.append('limit', '50');
+  params.append('page', '1');
+  params.append('sortBy', 'engagement');
+  params.append('order', 'desc');
+
+  const result = await args.late.call<{ posts?: unknown[]; data?: unknown[] } | unknown[]>({
+    endpoint: `/analytics?${params}`, method: 'GET',
+  });
+  if (result.error && result.status === 403) return { postAnalytics: [], analyticsNotEnabled: true };
+  if (result.error) {
+    args.log.warn('late_post_analytics_failed', { error: result.error });
+    return { postAnalytics: [], analyticsNotEnabled: false };
+  }
+  const raw = Array.isArray(result.data) ? result.data : (result.data?.posts ?? result.data?.data ?? []);
+  const postAnalytics = (Array.isArray(raw) ? raw : []).map((p) => normalizePost(p as Record<string, unknown>));
+  return { postAnalytics, analyticsNotEnabled: false };
+}
+
+function normalizePost(post: Record<string, unknown>): PostMetric {
+  const analytics = (post.analytics as Record<string, unknown> | undefined) ?? {};
+  const views = num(post.views, analytics.views, post.impressions, analytics.impressions);
+  const reach = num(post.reach, analytics.reach);
+  const likes = num(post.likes, analytics.likes, post.likeCount, analytics.likeCount);
+  const comments = num(post.comments, analytics.comments, post.commentCount, analytics.commentCount);
+  const shares = num(post.shares, analytics.shares, post.retweets, analytics.retweets, post.reposts, analytics.reposts);
+  const saves = num(post.saves, analytics.saves, post.bookmarks, analytics.bookmarks);
+  const clicks = num(post.clicks, analytics.clicks, post.linkClicks, analytics.linkClicks);
+  const engagement = num(post.engagement, analytics.engagement) || (likes + comments + shares + saves);
+  return {
+    id: String(post._id ?? post.id ?? post.postId ?? ''),
+    caption: str(post.caption, post.content, post.text),
+    posted_at: (post.publishedAt as string | undefined) ?? (post.postedAt as string | undefined) ?? (post.createdAt as string | undefined) ?? null,
+    platform: str(post.platform, post.provider),
+    accountId: str(post.accountId, post.account_id),
+    username: str(post.username),
+    impressions: views,
+    views,
+    reach,
+    likes,
+    comments,
+    shares,
+    saves,
+    clicks,
+    engagement,
+    engagementRate: num(post.engagementRate, analytics.engagementRate),
+    thumbnailUrl: (post.thumbnailUrl as string | undefined) ?? (post.mediaUrl as string | undefined) ?? (post.imageUrl as string | undefined) ?? null,
+  };
+}
+
+interface AggregateResult {
+  metrics: {
+    totalFollowers: number; totalPosts: number; totalImpressions: number; totalReach: number;
+    totalLikes: number; totalComments: number; totalShares: number; totalClicks: number;
+    averageEngagementRate: number;
+  };
+  platformBreakdown: Record<string, { platform: string; followers: number; impressions: number; engagement: number; posts: number }>;
+}
+
+function aggregate(followerStats: FollowerStat[], posts: PostMetric[]): AggregateResult {
+  const metrics = {
+    totalFollowers: 0, totalPosts: posts.length, totalImpressions: 0, totalReach: 0,
+    totalLikes: 0, totalComments: 0, totalShares: 0, totalClicks: 0, averageEngagementRate: 0,
+  };
+  const platformBreakdown: AggregateResult['platformBreakdown'] = {};
+  const ensure = (p: string) => {
+    platformBreakdown[p] ??= { platform: p, followers: 0, impressions: 0, engagement: 0, posts: 0 };
+    return platformBreakdown[p];
+  };
+  for (const s of followerStats) {
+    metrics.totalFollowers += s.current_followers;
+    ensure(s.platform || 'unknown').followers += s.current_followers;
+  }
+  for (const p of posts) {
+    metrics.totalImpressions += p.impressions;
+    metrics.totalReach += p.reach;
+    metrics.totalLikes += p.likes;
+    metrics.totalComments += p.comments;
+    metrics.totalShares += p.shares;
+    metrics.totalClicks += p.clicks;
+    const bucket = ensure(p.platform || 'unknown');
+    bucket.impressions += p.impressions;
+    bucket.engagement += p.engagement;
+    bucket.posts += 1;
+  }
+  if (metrics.totalImpressions > 0) {
+    const totalEngagements = metrics.totalLikes + metrics.totalComments + metrics.totalShares;
+    metrics.averageEngagementRate = (totalEngagements / metrics.totalImpressions) * 100;
+  }
+  return { metrics, platformBreakdown };
+}
+
+function emptyResponse(client: { business_name: string | null; brand_logo_url: string | null; brand_primary_color: string | null }, hasAnalyticsAccess: boolean, fromDate: string | null, toDate: string | null) {
+  return {
+    client: { name: client.business_name, logoUrl: client.brand_logo_url, primaryColor: client.brand_primary_color },
+    accounts: [], followerStats: [], postAnalytics: [],
+    aggregatedMetrics: { totalFollowers: 0, totalPosts: 0, totalImpressions: 0, totalReach: 0, totalLikes: 0, totalComments: 0, totalShares: 0, totalClicks: 0, averageEngagementRate: 0 },
+    platformBreakdown: [], topPosts: [],
+    hasAnalyticsAccess, noAccountsFound: true,
+    dateRange: { from: fromDate, to: toDate },
+    fetchedAt: new Date().toISOString(),
+  };
+}

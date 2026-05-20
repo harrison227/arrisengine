@@ -1,82 +1,41 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/**
+ * Build a knowledge base for a client either by analysing scraped website
+ * content (`action` omitted, the default flow), or by analysing existing
+ * knowledge entries (`action: 'analyze'`) for high-level brand insights.
+ *
+ * Contracts preserved:
+ *   --- Scrape flow ---
+ *   Request:  { clientId, scrapedData, userId? }
+ *   Response: { success, entriesCreated, entries[] }
+ *
+ *   --- Analyse flow ---
+ *   Request:  { action: 'analyze', clientName, knowledgeEntries }
+ *   Response: { positioning, differentiators[], opportunities[], compliance[], icp }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { badRequest, upstream } from '../_shared/errors.ts';
+import { ensureNonEmptyString, ensureOptionalUuid, ensureRecord, ensureUuid, sanitizeString } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireClientAccess, requireUser } from '../_shared/auth.ts';
+import { callGemini } from '../_shared/gemini.ts';
+import { requireEnv } from '../_shared/env.ts';
+import { timeoutSignal } from '../_shared/retry.ts';
 
-// Input validation helpers
-function isValidUUID(str: string): boolean {
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(str);
+interface RequestBody {
+  clientId?: unknown;
+  scrapedData?: unknown;
+  userId?: unknown;
+  action?: unknown;
+  clientName?: unknown;
+  knowledgeEntries?: unknown;
 }
 
-function sanitizeString(str: unknown, maxLength = 10000): string {
-  if (typeof str !== 'string') return '';
-  // Remove control characters except newlines and tabs
-  return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').slice(0, maxLength);
-}
+const VALID_CATEGORIES = ['brand', 'audience', 'competitors', 'offers', 'compliance', 'notes'] as const;
+type Category = typeof VALID_CATEGORIES[number];
+const GEMINI_TOOL_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
-
-  try {
-    // Parse and validate request body
-    let body;
-    try {
-      body = await req.json();
-    } catch {
-      return new Response(
-        JSON.stringify({ success: false, error: 'Invalid JSON request body' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const { clientId, scrapedData, userId, action, clientName, knowledgeEntries } = body;
-
-    // Handle analysis action
-    if (action === 'analyze') {
-      // Validate required fields for analysis
-      if (!clientName || typeof clientName !== 'string') {
-        return new Response(
-          JSON.stringify({ success: false, error: 'clientName is required and must be a string' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      if (!knowledgeEntries || typeof knowledgeEntries !== 'string') {
-        return new Response(
-          JSON.stringify({ success: false, error: 'knowledgeEntries is required for analysis' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      const GOOGLE_AI_API_KEY = Deno.env.get("GOOGLE_AI_API_KEY");
-      if (!GOOGLE_AI_API_KEY) {
-        throw new Error("GOOGLE_AI_API_KEY is not configured");
-      }
-
-      // Sanitize inputs for AI prompt
-      const sanitizedClientName = sanitizeString(clientName, 200);
-      const sanitizedKnowledgeEntries = sanitizeString(knowledgeEntries, 50000);
-
-      console.log('Generating knowledge base analysis...');
-
-      const aiResponse = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${GOOGLE_AI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gemini-2.5-flash",
-          messages: [
-            {
-              role: "system",
-              content: `You are an expert marketing strategist analyzing a client's knowledge base to generate actionable insights.
+const ANALYSE_SYSTEM = `You are an expert marketing strategist analyzing a client's knowledge base to generate actionable insights.
 
 Based on the knowledge entries provided, generate:
 1. A positioning summary (2-3 sentences on how this brand should position itself)
@@ -94,114 +53,10 @@ Return a JSON object with this structure:
   "icp": "Description of ideal customer..."
 }
 
-Be specific and actionable. Base everything on the actual knowledge base content provided.`
-            },
-            {
-              role: "user",
-              content: `Analyze this knowledge base for ${sanitizedClientName}:\n\n${sanitizedKnowledgeEntries}`
-            }
-          ],
-        }),
-      });
+Be specific and actionable. Base everything on the actual knowledge base content provided.`;
 
-      if (!aiResponse.ok) {
-        throw new Error(`AI analysis failed: ${aiResponse.status}`);
-      }
+const SCRAPE_SYSTEM = `You are an expert marketing strategist analyzing a client's website to build a comprehensive knowledge base.
 
-      const aiData = await aiResponse.json();
-      let result = {};
-      
-      const content = aiData.choices?.[0]?.message?.content;
-      if (content) {
-        try {
-          const jsonMatch = content.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            result = JSON.parse(jsonMatch[0]);
-          }
-        } catch (e) {
-          console.error('Error parsing analysis response:', e);
-        }
-      }
-
-      console.log('Analysis generated successfully');
-
-      return new Response(
-        JSON.stringify(result),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Original scraping flow - validate inputs
-    if (!clientId || typeof clientId !== 'string') {
-      return new Response(
-        JSON.stringify({ success: false, error: 'clientId is required and must be a string' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    if (!isValidUUID(clientId)) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'clientId must be a valid UUID' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    if (!scrapedData || typeof scrapedData !== 'object') {
-      return new Response(
-        JSON.stringify({ success: false, error: 'scrapedData is required and must be an object' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Validate userId if provided
-    if (userId && typeof userId === 'string' && !isValidUUID(userId)) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'userId must be a valid UUID if provided' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    const GOOGLE_AI_API_KEY = Deno.env.get("GOOGLE_AI_API_KEY");
-    if (!GOOGLE_AI_API_KEY) {
-      throw new Error("GOOGLE_AI_API_KEY is not configured");
-    }
-
-    // Combine all scraped content with size limits
-    let combinedContent = `# Main Page\n${sanitizeString(scrapedData.mainPage?.markdown, 30000)}\n\n`;
-    
-    if (Array.isArray(scrapedData.additionalPages)) {
-      for (const page of scrapedData.additionalPages.slice(0, 10)) { // Limit to 10 pages
-        if (page && typeof page.url === 'string' && typeof page.markdown === 'string') {
-          combinedContent += `# ${sanitizeString(page.url, 500)}\n${sanitizeString(page.markdown, 10000)}\n\n`;
-        }
-      }
-    }
-
-    // Add branding info if available
-    const branding = scrapedData.mainPage?.branding;
-    if (branding && typeof branding === 'object') {
-      combinedContent += `\n# Branding Information\n`;
-      combinedContent += `Colors: ${JSON.stringify(branding.colors || {})}\n`;
-      combinedContent += `Fonts: ${JSON.stringify(branding.fonts || [])}\n`;
-      combinedContent += `Logo: ${sanitizeString(branding.logo, 500) || 'Not found'}\n`;
-    }
-
-    console.log('Sending content to AI for analysis...');
-
-    // Use Lovable AI to analyze and categorize the content
-    const aiResponse = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GOOGLE_AI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gemini-2.5-flash",
-        messages: [
-          {
-            role: "system",
-            content: `You are an expert marketing strategist analyzing a client's website to build a comprehensive knowledge base. 
-            
 Extract and categorize information into these categories:
 - brand: Company mission, values, unique selling points, brand voice, tone, visual identity
 - audience: Target demographics, pain points, desires, customer segments
@@ -213,163 +68,173 @@ Extract and categorize information into these categories:
 Return a JSON object with this structure:
 {
   "entries": [
-    {
-      "category": "brand" | "audience" | "competitors" | "offers" | "compliance" | "notes",
-      "title": "Brief title for this insight",
-      "content": "Detailed content/insight"
-    }
+    { "category": "brand"|"audience"|"competitors"|"offers"|"compliance"|"notes", "title": "...", "content": "..." }
   ]
 }
 
-Be thorough but concise. Create 5-15 entries covering all relevant information found.`
-          },
-          {
-            role: "user",
-            content: `Analyze this website content and extract knowledge base entries:\n\n${combinedContent.slice(0, 50000)}`
-          }
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "create_knowledge_entries",
-              description: "Create knowledge base entries from website analysis",
-              parameters: {
-                type: "object",
-                properties: {
-                  entries: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      properties: {
-                        category: { 
-                          type: "string", 
-                          enum: ["brand", "audience", "competitors", "offers", "compliance", "notes"] 
-                        },
-                        title: { type: "string" },
-                        content: { type: "string" }
-                      },
-                      required: ["category", "title", "content"]
-                    }
-                  }
-                },
-                required: ["entries"]
-              }
-            }
-          }
-        ],
-        tool_choice: { type: "function", function: { name: "create_knowledge_entries" } }
-      }),
+Be thorough but concise. Create 5-15 entries covering all relevant information found.`;
+
+Deno.serve(withErrorHandling({ fn: 'build-knowledge-base' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+
+  // ----- analyse flow -----
+  if (body.action === 'analyze') {
+    const clientName = sanitizeString(ensureNonEmptyString('clientName', body.clientName, 200));
+    const knowledgeEntriesText = sanitizeString(ensureNonEmptyString('knowledgeEntries', body.knowledgeEntries, 50_000));
+
+    await requireUser(req);
+
+    const { text } = await callGemini({
+      messages: [
+        { role: 'system', content: ANALYSE_SYSTEM },
+        { role: 'user', content: `Analyze this knowledge base for ${clientName}:\n\n${knowledgeEntriesText}` },
+      ],
     });
-
-    if (!aiResponse.ok) {
-      const errorText = await aiResponse.text();
-      console.error('AI gateway error:', aiResponse.status, errorText);
-      throw new Error(`AI analysis failed: ${aiResponse.status}`);
+    const match = text.match(/\{[\s\S]*\}/);
+    let result: Record<string, unknown> = {};
+    if (match) {
+      try { result = JSON.parse(match[0]); } catch { /* preserve legacy soft-failure: return {} */ }
     }
-
-    const aiData = await aiResponse.json();
-    console.log('AI response received');
-
-    // Extract entries from tool call
-    let entries: Array<{ category: string; title: string; content: string }> = [];
-    
-    const toolCall = aiData.choices?.[0]?.message?.tool_calls?.[0];
-    if (toolCall?.function?.arguments) {
-      try {
-        const parsed = JSON.parse(toolCall.function.arguments);
-        entries = parsed.entries || [];
-      } catch (e) {
-        console.error('Error parsing AI response:', e);
-      }
-    }
-
-    if (entries.length === 0) {
-      // Fallback: try to parse from content
-      const content = aiData.choices?.[0]?.message?.content;
-      if (content) {
-        try {
-          const jsonMatch = content.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            entries = parsed.entries || [];
-          }
-        } catch (e) {
-          console.error('Error parsing fallback content:', e);
-        }
-      }
-    }
-
-    // Validate and sanitize entries
-    const validCategories = ['brand', 'audience', 'competitors', 'offers', 'compliance', 'notes'];
-    entries = entries.filter(entry => 
-      entry && 
-      typeof entry.category === 'string' && 
-      validCategories.includes(entry.category) &&
-      typeof entry.title === 'string' && 
-      typeof entry.content === 'string'
-    ).map(entry => ({
-      category: entry.category,
-      title: sanitizeString(entry.title, 200),
-      content: sanitizeString(entry.content, 5000)
-    }));
-
-    console.log(`Extracted ${entries.length} knowledge entries`);
-
-    // Save entries to database
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    const knowledgeEntriesToInsert = entries.map(entry => ({
-      client_id: clientId,
-      category: entry.category,
-      title: entry.title,
-      content: entry.content,
-      created_by: userId && isValidUUID(userId) ? userId : null,
-    }));
-
-    if (knowledgeEntriesToInsert.length > 0) {
-      const { error: insertError } = await supabase
-        .from('knowledge_entries')
-        .insert(knowledgeEntriesToInsert);
-
-      if (insertError) {
-        console.error('Error inserting knowledge entries:', insertError);
-        throw insertError;
-      }
-    }
-
-    // Store branding info as a special entry if available
-    if (branding && typeof branding === 'object') {
-      await supabase
-        .from('knowledge_entries')
-        .insert({
-          client_id: clientId,
-          category: 'brand',
-          title: 'Visual Brand Identity',
-          content: `Primary Color: ${sanitizeString(branding.colors?.primary, 50) || 'Not detected'}\n` +
-                   `Secondary Color: ${sanitizeString(branding.colors?.secondary, 50) || 'Not detected'}\n` +
-                   `Background: ${sanitizeString(branding.colors?.background, 50) || 'Not detected'}\n` +
-                   `Fonts: ${Array.isArray(branding.fonts) ? branding.fonts.slice(0, 5).map((f: { family?: string }) => sanitizeString(f?.family, 50)).join(', ') : 'Not detected'}\n` +
-                   `Logo URL: ${sanitizeString(branding.logo, 500) || 'Not found'}`,
-          created_by: userId && isValidUUID(userId) ? userId : null,
-        });
-    }
-
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        entriesCreated: knowledgeEntriesToInsert.length + (branding ? 1 : 0),
-        entries: knowledgeEntriesToInsert
-      }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error in build-knowledge-base:', error);
-    return new Response(
-      JSON.stringify({ success: false, error: 'An unexpected error occurred' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    log.info('analysis_done');
+    return jsonResponse(result);
   }
-});
+
+  // ----- scrape flow -----
+  const clientId = ensureUuid('clientId', body.clientId);
+  const userId = ensureOptionalUuid('userId', body.userId);
+  if (!body.scrapedData || typeof body.scrapedData !== 'object' || Array.isArray(body.scrapedData)) {
+    throw badRequest('scrapedData is required and must be an object');
+  }
+
+  await requireClientAccess(req, clientId);
+
+  const scrapedData = body.scrapedData as { mainPage?: { markdown?: string; branding?: { colors?: Record<string, string>; fonts?: Array<{ family?: string }>; logo?: string } }; additionalPages?: Array<{ url?: string; markdown?: string }> };
+
+  let combinedContent = `# Main Page\n${sanitizeString(scrapedData.mainPage?.markdown ?? '', 30_000)}\n\n`;
+  if (Array.isArray(scrapedData.additionalPages)) {
+    for (const page of scrapedData.additionalPages.slice(0, 10)) {
+      if (page && typeof page.url === 'string' && typeof page.markdown === 'string') {
+        combinedContent += `# ${sanitizeString(page.url, 500)}\n${sanitizeString(page.markdown, 10_000)}\n\n`;
+      }
+    }
+  }
+  const branding = scrapedData.mainPage?.branding;
+  if (branding) {
+    combinedContent += `\n# Branding Information\n`;
+    combinedContent += `Colors: ${JSON.stringify(branding.colors ?? {})}\n`;
+    combinedContent += `Fonts: ${JSON.stringify(branding.fonts ?? [])}\n`;
+    combinedContent += `Logo: ${sanitizeString(branding.logo ?? '', 500) || 'Not found'}\n`;
+  }
+
+  // We use the function-tool variant directly here because it gives us
+  // structured output (`tool_calls`) that the shared callGemini wrapper
+  // doesn't currently expose.
+  const apiKey = requireEnv('GOOGLE_AI_API_KEY');
+  const aiResponse = await fetch(GEMINI_TOOL_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: SCRAPE_SYSTEM },
+        { role: 'user', content: `Analyze this website content and extract knowledge base entries:\n\n${combinedContent.slice(0, 50_000)}` },
+      ],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'create_knowledge_entries',
+          description: 'Create knowledge base entries from website analysis',
+          parameters: {
+            type: 'object',
+            properties: {
+              entries: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    category: { type: 'string', enum: VALID_CATEGORIES },
+                    title: { type: 'string' },
+                    content: { type: 'string' },
+                  },
+                  required: ['category', 'title', 'content'],
+                },
+              },
+            },
+            required: ['entries'],
+          },
+        },
+      }],
+      tool_choice: { type: 'function', function: { name: 'create_knowledge_entries' } },
+    }),
+    signal: timeoutSignal(90_000),
+  });
+
+  if (!aiResponse.ok) {
+    const errorText = await aiResponse.text().catch(() => '');
+    log.error('ai_failed', undefined, { status: aiResponse.status, body: errorText.slice(0, 500) });
+    throw upstream('AI analysis failed', 502);
+  }
+  const aiData = await aiResponse.json() as { choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ function?: { arguments?: string } }> } }> };
+
+  let entries: Array<{ category: Category; title: string; content: string }> = [];
+  const toolArgs = aiData.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
+  if (toolArgs) {
+    try {
+      const parsed = JSON.parse(toolArgs) as { entries?: Array<{ category?: string; title?: string; content?: string }> };
+      entries = (parsed.entries ?? []).filter((e): e is { category: Category; title: string; content: string } =>
+        Boolean(e?.category) && (VALID_CATEGORIES as readonly string[]).includes(e.category as string) &&
+        typeof e.title === 'string' && typeof e.content === 'string',
+      );
+    } catch (err) {
+      log.warn('tool_args_parse_failed', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  if (entries.length === 0) {
+    const content = aiData.choices?.[0]?.message?.content;
+    const m = content?.match(/\{[\s\S]*\}/);
+    if (m) {
+      try {
+        const parsed = JSON.parse(m[0]) as { entries?: Array<{ category?: string; title?: string; content?: string }> };
+        entries = (parsed.entries ?? []).filter((e): e is { category: Category; title: string; content: string } =>
+          Boolean(e?.category) && (VALID_CATEGORIES as readonly string[]).includes(e.category as string) &&
+          typeof e.title === 'string' && typeof e.content === 'string',
+        );
+      } catch (err) {
+        log.warn('content_fallback_parse_failed', { error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+  entries = entries.map((e) => ({ category: e.category, title: sanitizeString(e.title, 200), content: sanitizeString(e.content, 5_000) }));
+
+  const supabase = getSupabaseAdmin();
+  const insertPayload = entries.map((e) => ({ client_id: clientId, category: e.category, title: e.title, content: e.content, created_by: userId ?? null }));
+  if (insertPayload.length > 0) {
+    const { error: insertError } = await supabase.from('knowledge_entries').insert(insertPayload);
+    if (insertError) throw new Error(insertError.message);
+  }
+
+  if (branding) {
+    const fonts = Array.isArray(branding.fonts) ? branding.fonts.slice(0, 5).map((f) => sanitizeString(f?.family ?? '', 50)).filter(Boolean).join(', ') : 'Not detected';
+    await supabase.from('knowledge_entries').insert({
+      client_id: clientId,
+      category: 'brand',
+      title: 'Visual Brand Identity',
+      content: [
+        `Primary Color: ${sanitizeString(branding.colors?.primary ?? '', 50) || 'Not detected'}`,
+        `Secondary Color: ${sanitizeString(branding.colors?.secondary ?? '', 50) || 'Not detected'}`,
+        `Background: ${sanitizeString(branding.colors?.background ?? '', 50) || 'Not detected'}`,
+        `Fonts: ${fonts}`,
+        `Logo URL: ${sanitizeString(branding.logo ?? '', 500) || 'Not found'}`,
+      ].join('\n'),
+      created_by: userId ?? null,
+    });
+  }
+
+  log.info('knowledge_entries_persisted', { count: insertPayload.length, branding: Boolean(branding) });
+
+  return jsonResponse({
+    success: true,
+    entriesCreated: insertPayload.length + (branding ? 1 : 0),
+    entries: insertPayload,
+  });
+}));

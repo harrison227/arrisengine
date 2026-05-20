@@ -12,7 +12,7 @@ import {
 } from '@/components/ui/dialog';
 import { Download, Loader2 } from 'lucide-react';
 import { AnalyticsData } from '@/hooks/useLateAnalytics';
-import { generateAnalyticsPdf, PdfExportOptions } from '@/lib/analyticsPdf';
+import type { PdfExportOptions } from '@/lib/analyticsPdf';
 import { toast } from 'sonner';
 
 interface AnalyticsPdfExportProps {
@@ -35,6 +35,7 @@ export function AnalyticsPdfExport({ data, agencyName, open, onOpenChange }: Ana
   const handleExport = async () => {
     setIsExporting(true);
     try {
+      const { generateAnalyticsPdf } = await import('@/lib/analyticsPdf');
       await generateAnalyticsPdf(data, options, agencyName);
       toast.success('PDF exported successfully');
       onOpenChange(false);

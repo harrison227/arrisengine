@@ -1,70 +1,60 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/**
+ * Generate a 30-day content plan for a client and persist it as a single
+ * content_plans row whose `brief` field is the JSON-serialised idea list
+ * (matching the format produced by ai-content-session).
+ *
+ * Contract preserved:
+ *   Request:  { clientId, clientName?, industry? }
+ *   Response: { success, plansCreated, ideasCount, plans: [...] }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { upstream } from '../_shared/errors.ts';
+import { ensureOptionalString, ensureUuid } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireClientAccess } from '../_shared/auth.ts';
+import { requireEnv } from '../_shared/env.ts';
+import { timeoutSignal } from '../_shared/retry.ts';
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
+interface RequestBody { clientId: unknown; clientName?: unknown; industry?: unknown }
 
-  try {
-    const { clientId, clientName, industry } = await req.json();
+const GEMINI_TOOL_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
 
-    if (!clientId) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'clientId is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+interface AiPlan {
+  title: string;
+  brief: string;
+  filming_date: string;
+  content_pieces: Array<{ concept: string; hook: string; content_type: string; platform: string }>;
+}
 
-    const GOOGLE_AI_API_KEY = Deno.env.get("GOOGLE_AI_API_KEY");
-    if (!GOOGLE_AI_API_KEY) {
-      throw new Error("GOOGLE_AI_API_KEY is not configured");
-    }
+Deno.serve(withErrorHandling({ fn: 'generate-content-strategy' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const clientId = ensureUuid('clientId', body.clientId);
+  const clientName = ensureOptionalString('clientName', body.clientName, 500) ?? 'Unknown';
+  const industry = ensureOptionalString('industry', body.industry, 500) ?? 'General';
 
-    // Get knowledge base entries for context
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+  await requireClientAccess(req, clientId);
 
-    const { data: knowledgeEntries, error: kbError } = await supabase
-      .from('knowledge_entries')
-      .select('*')
-      .eq('client_id', clientId);
+  const supabase = getSupabaseAdmin();
+  const apiKey = requireEnv('GOOGLE_AI_API_KEY');
 
-    if (kbError) {
-      console.error('Error fetching knowledge entries:', kbError);
-    }
+  const { data: knowledgeEntries } = await supabase.from('knowledge_entries').select('*').eq('client_id', clientId);
+  const knowledgeContext = (knowledgeEntries ?? [])
+    .map((e) => `## ${(e.category as string).toUpperCase()}: ${e.title}\n${e.content}`)
+    .join('\n\n');
 
-    // Build context from knowledge base
-    let knowledgeContext = '';
-    if (knowledgeEntries && knowledgeEntries.length > 0) {
-      for (const entry of knowledgeEntries) {
-        knowledgeContext += `## ${entry.category.toUpperCase()}: ${entry.title}\n${entry.content}\n\n`;
-      }
-    }
+  const today = new Date();
+  const thirtyDays = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    const today = new Date();
-    const thirtyDaysFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
-
-    console.log('Generating content strategy for client:', clientName);
-
-    const aiResponse = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GOOGLE_AI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gemini-2.5-flash",
-        messages: [
-          {
-            role: "system",
-            content: `You are an expert content strategist creating a 30-day content plan for a client.
+  const aiResponse = await fetch(GEMINI_TOOL_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gemini-2.5-flash',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an expert content strategist creating a 30-day content plan for a client.
 
 Based on the client's knowledge base, create content plans that:
 - Are tailored to their brand voice and target audience
@@ -74,148 +64,106 @@ Based on the client's knowledge base, create content plans that:
 - Target appropriate platforms (TikTok, Instagram, YouTube, LinkedIn, Facebook)
 
 Today's date is ${today.toISOString().split('T')[0]}.
-Create plans spread across the next 30 days ending ${thirtyDaysFromNow.toISOString().split('T')[0]}.`
-          },
-          {
-            role: "user",
-            content: `Create a 30-day content strategy for this client:
+Create plans spread across the next 30 days ending ${thirtyDays.toISOString().split('T')[0]}.`,
+        },
+        {
+          role: 'user',
+          content: `Create a 30-day content strategy for this client:
 
-Client: ${clientName || 'Unknown'}
-Industry: ${industry || 'General'}
+Client: ${clientName}
+Industry: ${industry}
 
 Knowledge Base:
 ${knowledgeContext || 'No knowledge base entries available. Create general content suggestions based on the industry.'}
 
-Generate 25-30 content plans with filming dates spread across the month. Include a variety of content types and platforms.`
-          }
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "create_content_plans",
-              description: "Create content plans for the next 30 days",
-              parameters: {
-                type: "object",
-                properties: {
-                  plans: {
-                    type: "array",
-                    items: {
-                      type: "object",
-                      properties: {
-                        title: { type: "string", description: "Content plan title" },
-                        brief: { type: "string", description: "Detailed content brief with hook ideas and key messages" },
-                        filming_date: { type: "string", description: "ISO date string for filming (YYYY-MM-DD)" },
-                        content_pieces: {
-                          type: "array",
-                          items: {
-                            type: "object",
-                            properties: {
-                              concept: { type: "string", description: "Content concept/idea" },
-                              hook: { type: "string", description: "Opening hook to grab attention" },
-                              content_type: { 
-                                type: "string", 
-                                enum: ["video", "image", "carousel", "story", "reel", "ugc"] 
-                              },
-                              platform: { type: "string", description: "Target platform" }
-                            },
-                            required: ["concept", "hook", "content_type", "platform"]
-                          }
-                        }
+Generate 25-30 content plans with filming dates spread across the month. Include a variety of content types and platforms.`,
+        },
+      ],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'create_content_plans',
+          description: 'Create content plans for the next 30 days',
+          parameters: {
+            type: 'object',
+            properties: {
+              plans: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string' },
+                    brief: { type: 'string' },
+                    filming_date: { type: 'string' },
+                    content_pieces: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          concept: { type: 'string' },
+                          hook: { type: 'string' },
+                          content_type: { type: 'string', enum: ['video', 'image', 'carousel', 'story', 'reel', 'ugc'] },
+                          platform: { type: 'string' },
+                        },
+                        required: ['concept', 'hook', 'content_type', 'platform'],
                       },
-                      required: ["title", "brief", "filming_date", "content_pieces"]
-                    }
-                  }
+                    },
+                  },
+                  required: ['title', 'brief', 'filming_date', 'content_pieces'],
                 },
-                required: ["plans"]
-              }
-            }
-          }
-        ],
-        tool_choice: { type: "function", function: { name: "create_content_plans" } }
-      }),
-    });
+              },
+            },
+            required: ['plans'],
+          },
+        },
+      }],
+      tool_choice: { type: 'function', function: { name: 'create_content_plans' } },
+    }),
+    signal: timeoutSignal(120_000),
+  });
 
-    if (!aiResponse.ok) {
-      const errorText = await aiResponse.text();
-      console.error('AI gateway error:', aiResponse.status, errorText);
-      throw new Error(`AI strategy generation failed: ${aiResponse.status}`);
-    }
-
-    const aiData = await aiResponse.json();
-    console.log('AI strategy response received');
-
-    // Extract plans from tool call
-    let plans: Array<{
-      title: string;
-      brief: string;
-      filming_date: string;
-      content_pieces: Array<{
-        concept: string;
-        hook: string;
-        content_type: string;
-        platform: string;
-      }>;
-    }> = [];
-
-    const toolCall = aiData.choices?.[0]?.message?.tool_calls?.[0];
-    if (toolCall?.function?.arguments) {
-      try {
-        const parsed = JSON.parse(toolCall.function.arguments);
-        plans = parsed.plans || [];
-      } catch (e) {
-        console.error('Error parsing AI response:', e);
-      }
-    }
-
-    console.log(`Generated ${plans.length} content plans`);
-
-    // Create a SINGLE content plan with all ideas bundled together
-    // Convert plans into the format expected by the content plan brief (JSON array)
-    const contentIdeas = plans.map(plan => ({
-      hook: plan.title,
-      script: plan.brief,
-      formatType: plan.content_pieces?.[0]?.content_type || 'video',
-      platform: plan.content_pieces?.map(p => p.platform) || ['instagram'],
-      duration: 60,
-      contentPieces: plan.content_pieces,
-    }));
-
-    const planTitle = `${clientName || 'Client'} - 30 Day Content Strategy`;
-    
-    const { data: contentPlan, error: planError } = await supabase
-      .from('content_plans')
-      .insert({
-        client_id: clientId,
-        title: planTitle,
-        brief: JSON.stringify(contentIdeas), // Store as JSON array like AI Chat does
-        filming_date: null,
-        status: 'planning',
-      })
-      .select()
-      .single();
-
-    if (planError) {
-      console.error('Error creating content plan:', planError);
-      throw new Error('Failed to create content plan');
-    }
-
-    console.log(`Created 1 content plan with ${contentIdeas.length} ideas`);
-
-    return new Response(
-      JSON.stringify({ 
-        success: true, 
-        plansCreated: 1,
-        ideasCount: contentIdeas.length,
-        plans: [contentPlan]
-      }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error in generate-content-strategy:', error);
-    return new Response(
-      JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+  if (!aiResponse.ok) {
+    const errText = await aiResponse.text().catch(() => '');
+    log.error('ai_failed', undefined, { status: aiResponse.status, body: errText.slice(0, 500) });
+    throw upstream('AI strategy generation failed', 502);
   }
-});
+  const aiData = await aiResponse.json() as { choices?: Array<{ message?: { tool_calls?: Array<{ function?: { arguments?: string } }> } }> };
+  const toolArgs = aiData.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
+  let plans: AiPlan[] = [];
+  if (toolArgs) {
+    try { plans = (JSON.parse(toolArgs) as { plans?: AiPlan[] }).plans ?? []; }
+    catch (err) { log.warn('tool_args_parse_failed', { error: err instanceof Error ? err.message : String(err) }); }
+  }
+
+  const contentIdeas = plans.map((plan) => ({
+    hook: plan.title,
+    script: plan.brief,
+    formatType: plan.content_pieces?.[0]?.content_type ?? 'video',
+    platform: plan.content_pieces?.map((p) => p.platform) ?? ['instagram'],
+    duration: 60,
+    contentPieces: plan.content_pieces,
+  }));
+
+  const planTitle = `${clientName} - 30 Day Content Strategy`;
+  const { data: contentPlan, error: planError } = await supabase
+    .from('content_plans')
+    .insert({
+      client_id: clientId,
+      title: planTitle,
+      brief: JSON.stringify(contentIdeas),
+      filming_date: null,
+      status: 'planning',
+    })
+    .select()
+    .single();
+  if (planError) throw new Error(planError.message);
+
+  log.info('content_strategy_persisted', { ideas: contentIdeas.length });
+
+  return jsonResponse({
+    success: true,
+    plansCreated: 1,
+    ideasCount: contentIdeas.length,
+    plans: [contentPlan],
+  });
+}));

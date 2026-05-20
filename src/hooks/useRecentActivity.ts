@@ -69,7 +69,7 @@ export function useRecentActivity(limit = 10) {
             id: `content-${plan.id}`,
             type: 'content',
             title: `Content plan: ${plan.title}`,
-            description: (plan.client as any)?.business_name || 'Unknown client',
+            description: (plan.client as { business_name?: string } | null)?.business_name || 'Unknown client',
             timestamp: plan.created_at,
           });
         });

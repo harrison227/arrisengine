@@ -70,12 +70,11 @@ const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v'];
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
 
 const to24Hour = (hour: string, period: "AM" | "PM"): number => {
-  let h = parseInt(hour, 10);
+  const h = parseInt(hour, 10);
   if (period === "AM") {
     return h === 12 ? 0 : h;
-  } else {
-    return h === 12 ? 12 : h + 12;
   }
+  return h === 12 ? 12 : h + 12;
 };
 
 type PlatformOption = { id: string; label: string; icon: string };

@@ -1,151 +1,88 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+/**
+ * Transcribe a video / audio clip via OpenAI Whisper.
+ *
+ * Contract preserved:
+ *   Request:  { audioBase64?, mimeType?, videoUrl? }
+ *   Response: { transcript } | { transcript:'', warning } | { error }
+ */
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { badRequest, rateLimited, upstream } from '../_shared/errors.ts';
+import { ensureOptionalString } from '../_shared/validation.ts';
+import { requireUser } from '../_shared/auth.ts';
+import { requireEnv } from '../_shared/env.ts';
+import { timeoutSignal } from '../_shared/retry.ts';
 
-serve(async (req) => {
-  // Handle CORS preflight
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+const WHISPER_URL = 'https://api.openai.com/v1/audio/transcriptions';
+const MAX_BYTES = 25 * 1024 * 1024;
+
+interface RequestBody { audioBase64?: unknown; mimeType?: unknown; videoUrl?: unknown }
+
+function extensionFor(mimeType: string | undefined): string {
+  const m = (mimeType ?? '').toLowerCase();
+  if (m.includes('wav') || m.includes('wave')) return 'wav';
+  if (m.includes('webm')) return 'webm';
+  if (m.includes('mp3') || m.includes('mpeg')) return 'mp3';
+  if (m.includes('ogg')) return 'ogg';
+  if (m.includes('m4a') || m.includes('mp4')) return 'm4a';
+  return 'webm';
+}
+
+Deno.serve(withErrorHandling({ fn: 'transcribe-video' }, async ({ req, log }) => {
+  await requireUser(req);
+  const apiKey = requireEnv('OPENAI_API_KEY');
+  const body = await parseJsonBody<RequestBody>(req);
+  const audioBase64 = ensureOptionalString('audioBase64', body.audioBase64, 50_000_000);
+  const mimeType = ensureOptionalString('mimeType', body.mimeType, 200);
+  const videoUrl = ensureOptionalString('videoUrl', body.videoUrl, 4_000);
+
+  let audioBlob: Blob;
+  let extension = 'webm';
+
+  if (audioBase64) {
+    const binary = atob(audioBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    audioBlob = new Blob([bytes], { type: mimeType || 'audio/webm' });
+    extension = extensionFor(mimeType);
+    log.info('audio_blob_decoded', { size: audioBlob.size, extension });
+  } else if (videoUrl) {
+    const res = await fetch(videoUrl, { signal: timeoutSignal(60_000) });
+    if (!res.ok) throw badRequest('Failed to fetch video file');
+    audioBlob = await res.blob();
+    const urlExt = new URL(videoUrl).pathname.split('.').pop()?.toLowerCase();
+    if (urlExt && ['mp4', 'mov', 'webm', 'avi', 'm4a', 'mp3', 'wav'].includes(urlExt)) extension = urlExt;
+    log.info('video_fetched', { size: audioBlob.size, extension });
+  } else {
+    throw badRequest('Either audioBase64 or videoUrl is required');
   }
 
-  try {
-    const body = await req.json();
-    const { audioBase64, mimeType, videoUrl } = body;
-
-    const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
-    if (!OPENAI_API_KEY) {
-      console.error("OPENAI_API_KEY not configured");
-      return new Response(
-        JSON.stringify({ error: "Transcription service not configured" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    let audioBlob: Blob;
-    let extension = "webm";
-
-    // Handle base64 audio from client-side extraction
-    if (audioBase64) {
-      console.log("Processing base64 audio, mimeType:", mimeType);
-      
-      // Convert base64 to blob
-      const binaryString = atob(audioBase64);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      
-      audioBlob = new Blob([bytes], { type: mimeType || "audio/webm" });
-      
-      // Determine extension from mime type - be thorough
-      if (mimeType?.includes("wav") || mimeType?.includes("wave")) {
-        extension = "wav";
-      } else if (mimeType?.includes("webm")) {
-        extension = "webm";
-      } else if (mimeType?.includes("mp3") || mimeType?.includes("mpeg")) {
-        extension = "mp3";
-      } else if (mimeType?.includes("ogg")) {
-        extension = "ogg";
-      } else if (mimeType?.includes("m4a") || mimeType?.includes("mp4")) {
-        extension = "m4a";
-      }
-      
-      const sizeMB = (audioBlob.size / 1024 / 1024).toFixed(2);
-      console.log(`Audio blob size: ${audioBlob.size} bytes (${sizeMB}MB), extension: ${extension}`);
-    }
-    // Legacy: Handle video URL (fallback for older requests)
-    else if (videoUrl) {
-      console.log("Fetching video from URL:", videoUrl);
-      
-      const videoResponse = await fetch(videoUrl);
-      if (!videoResponse.ok) {
-        console.error("Failed to fetch video:", videoResponse.status);
-        return new Response(
-          JSON.stringify({ error: "Failed to fetch video file" }),
-          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      audioBlob = await videoResponse.blob();
-      const contentType = videoResponse.headers.get("content-type") || "video/mp4";
-      
-      // Get file extension from URL or content type
-      const urlPath = new URL(videoUrl).pathname;
-      const urlExt = urlPath.split('.').pop()?.toLowerCase();
-      if (urlExt && ['mp4', 'mov', 'webm', 'avi', 'm4a', 'mp3', 'wav'].includes(urlExt)) {
-        extension = urlExt;
-      }
-      
-      console.log("Video size:", audioBlob.size, "bytes, type:", contentType);
-    }
-    else {
-      return new Response(
-        JSON.stringify({ error: "Either audioBase64 or videoUrl is required" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    // Check file size (Whisper API limit is 25MB)
-    if (audioBlob.size > 25 * 1024 * 1024) {
-      console.log("Audio too large for Whisper API, returning empty transcript");
-      return new Response(
-        JSON.stringify({ 
-          transcript: "", 
-          warning: "Audio exceeds 25MB limit for transcription. Caption will need to be written manually." 
-        }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    // Create form data for Whisper API
-    const formData = new FormData();
-    formData.append("file", audioBlob, `audio.${extension}`);
-    formData.append("model", "whisper-1");
-    formData.append("response_format", "text");
-
-    console.log("Sending to Whisper API, file size:", audioBlob.size);
-
-    const whisperResponse = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: formData,
+  if (audioBlob.size > MAX_BYTES) {
+    log.warn('audio_too_large', { size: audioBlob.size });
+    return jsonResponse({
+      transcript: '',
+      warning: 'Audio exceeds 25MB limit for transcription. Caption will need to be written manually.',
     });
-
-    if (!whisperResponse.ok) {
-      const errorText = await whisperResponse.text();
-      console.error("Whisper API error:", whisperResponse.status, errorText);
-      
-      if (whisperResponse.status === 429) {
-        return new Response(
-          JSON.stringify({ error: "Rate limit exceeded. Please try again later." }),
-          { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-      
-      return new Response(
-        JSON.stringify({ error: "Transcription failed", details: errorText }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    const transcript = await whisperResponse.text();
-    console.log("Transcription successful, length:", transcript.length);
-
-    return new Response(
-      JSON.stringify({ transcript: transcript.trim() }),
-      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
-
-  } catch (error) {
-    console.error("Transcription error:", error);
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
   }
-});
+
+  const formData = new FormData();
+  formData.append('file', audioBlob, `audio.${extension}`);
+  formData.append('model', 'whisper-1');
+  formData.append('response_format', 'text');
+
+  const res = await fetch(WHISPER_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: formData,
+    signal: timeoutSignal(120_000),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    if (res.status === 429) throw rateLimited('Rate limit exceeded. Please try again later.');
+    log.error('whisper_failed', undefined, { status: res.status, body: text.slice(0, 500) });
+    throw upstream('Transcription failed', 502, { details: text.slice(0, 500) });
+  }
+  const transcript = (await res.text()).trim();
+  log.info('transcription_done', { length: transcript.length });
+  return jsonResponse({ transcript });
+}));

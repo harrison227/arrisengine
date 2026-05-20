@@ -1,130 +1,87 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+/**
+ * Returns the data the frontend needs to assemble the onboarding PDF.
+ * (Actual PDF generation runs client-side via jspdf for performance.)
+ *
+ * Contract preserved:
+ *   Request:  { clientId, platforms, assetNeeds, customNote }
+ *   Response: { success, client, knowledgeSummary, agencySettings, config, generatedAt }
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-};
+import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
+import { notFound } from '../_shared/errors.ts';
+import { ensureBoolean, ensureOptionalString, ensureRecord, ensureUuid } from '../_shared/validation.ts';
+import { getSupabaseAdmin } from '../_shared/supabase.ts';
+import { requireClientAccess } from '../_shared/auth.ts';
 
-interface OnboardingRequest {
-  clientId: string;
-  platforms: {
-    facebook: boolean;
-    tiktok: boolean;
-    google: boolean;
-    youtube: boolean;
-    instagram: boolean;
+interface PlatformsInput { facebook: unknown; tiktok: unknown; google: unknown; youtube: unknown; instagram: unknown }
+interface AssetNeedsInput { rawFootage: unknown; productShipment: unknown; brandAssets: unknown; ugc: unknown }
+interface RequestBody { clientId: unknown; platforms: unknown; assetNeeds: unknown; customNote?: unknown }
+
+Deno.serve(withErrorHandling({ fn: 'generate-onboarding-pdf' }, async ({ req, log }) => {
+  const body = await parseJsonBody<RequestBody>(req);
+  const clientId = ensureUuid('clientId', body.clientId);
+  const platformsRaw = ensureRecord('platforms', body.platforms) as unknown as PlatformsInput;
+  const assetNeedsRaw = ensureRecord('assetNeeds', body.assetNeeds) as unknown as AssetNeedsInput;
+  const customNote = ensureOptionalString('customNote', body.customNote, 5_000) ?? '';
+
+  await requireClientAccess(req, clientId);
+
+  const platforms = {
+    facebook: ensureBoolean('platforms.facebook', platformsRaw.facebook),
+    tiktok: ensureBoolean('platforms.tiktok', platformsRaw.tiktok),
+    google: ensureBoolean('platforms.google', platformsRaw.google),
+    youtube: ensureBoolean('platforms.youtube', platformsRaw.youtube),
+    instagram: ensureBoolean('platforms.instagram', platformsRaw.instagram),
   };
-  assetNeeds: {
-    rawFootage: boolean;
-    productShipment: boolean;
-    brandAssets: boolean;
-    ugc: boolean;
+  const assetNeeds = {
+    rawFootage: ensureBoolean('assetNeeds.rawFootage', assetNeedsRaw.rawFootage),
+    productShipment: ensureBoolean('assetNeeds.productShipment', assetNeedsRaw.productShipment),
+    brandAssets: ensureBoolean('assetNeeds.brandAssets', assetNeedsRaw.brandAssets),
+    ugc: ensureBoolean('assetNeeds.ugc', assetNeedsRaw.ugc),
   };
-  customNote: string;
-}
 
-serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders });
-  }
+  const supabase = getSupabaseAdmin();
 
-  try {
-    const { clientId, platforms, assetNeeds, customNote } = await req.json() as OnboardingRequest;
+  const [{ data: client }, { data: knowledgeSummary }, { data: agencySettings }] = await Promise.all([
+    supabase.from('clients').select('*').eq('id', clientId).maybeSingle(),
+    supabase.from('knowledge_summary').select('*').eq('client_id', clientId).maybeSingle(),
+    supabase.from('agency_settings').select('*').limit(1).maybeSingle(),
+  ]);
 
-    if (!clientId) {
-      return new Response(
-        JSON.stringify({ success: false, error: 'clientId is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+  if (!client) throw notFound('Client not found');
 
-    console.log('Generating onboarding packet for client:', clientId);
-    console.log('Platforms selected:', platforms);
-    console.log('Asset needs:', assetNeeds);
+  log.info('onboarding_payload_built', {
+    clientId,
+    hasKnowledgeSummary: Boolean(knowledgeSummary),
+    hasAgencySettings: Boolean(agencySettings),
+  });
 
-    // Initialize Supabase client
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    // Fetch client data
-    const { data: client, error: clientError } = await supabase
-      .from('clients')
-      .select('*')
-      .eq('id', clientId)
-      .single();
-
-    if (clientError || !client) {
-      console.error('Client not found:', clientError);
-      throw new Error('Client not found');
-    }
-
-    console.log('Found client:', client.business_name);
-
-    // Fetch knowledge summary for the client
-    const { data: knowledgeSummary, error: summaryError } = await supabase
-      .from('knowledge_summary')
-      .select('*')
-      .eq('client_id', clientId)
-      .maybeSingle();
-
-    if (summaryError) {
-      console.warn('Could not fetch knowledge summary:', summaryError);
-    }
-
-    console.log('Knowledge summary found:', !!knowledgeSummary);
-
-    // Fetch agency settings (optional, for branding)
-    const { data: agencySettings } = await supabase
-      .from('agency_settings')
-      .select('*')
-      .limit(1)
-      .maybeSingle();
-
-    console.log('Agency settings found:', !!agencySettings);
-
-    // Return data for PDF generation on client-side
-    return new Response(
-      JSON.stringify({
-        success: true,
-        client: {
-          id: client.id,
-          business_name: client.business_name,
-          contact_name: client.contact_name,
-          email: client.email,
-          phone: client.phone,
-          website: client.website,
-          industry: client.industry,
-          mrr: client.mrr,
-          status: client.status,
-        },
-        knowledgeSummary: knowledgeSummary ? {
-          positioning_summary: knowledgeSummary.positioning_summary,
-          key_differentiators: knowledgeSummary.key_differentiators || [],
-          content_opportunities: knowledgeSummary.content_opportunities || [],
-          compliance_flags: knowledgeSummary.compliance_flags || [],
-          ideal_customer_profile: knowledgeSummary.ideal_customer_profile,
-        } : null,
-        agencySettings: agencySettings ? {
-          agency_name: agencySettings.agency_name,
-          logo_url: agencySettings.logo_url,
-          primary_color: agencySettings.primary_color,
-        } : null,
-        config: {
-          platforms,
-          assetNeeds,
-          customNote,
-        },
-        generatedAt: new Date().toISOString(),
-      }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    console.error('Error in generate-onboarding-pdf:', error);
-    return new Response(
-      JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
-  }
-});
+  return jsonResponse({
+    success: true,
+    client: {
+      id: client.id,
+      business_name: client.business_name,
+      contact_name: client.contact_name,
+      email: client.email,
+      phone: client.phone,
+      website: client.website,
+      industry: client.industry,
+      mrr: client.mrr,
+      status: client.status,
+    },
+    knowledgeSummary: knowledgeSummary ? {
+      positioning_summary: knowledgeSummary.positioning_summary,
+      key_differentiators: knowledgeSummary.key_differentiators ?? [],
+      content_opportunities: knowledgeSummary.content_opportunities ?? [],
+      compliance_flags: knowledgeSummary.compliance_flags ?? [],
+      ideal_customer_profile: knowledgeSummary.ideal_customer_profile,
+    } : null,
+    agencySettings: agencySettings ? {
+      agency_name: agencySettings.agency_name,
+      logo_url: agencySettings.logo_url,
+      primary_color: agencySettings.primary_color,
+    } : null,
+    config: { platforms, assetNeeds, customNote },
+    generatedAt: new Date().toISOString(),
+  });
+}));

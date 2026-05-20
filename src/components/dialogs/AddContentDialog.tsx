@@ -65,12 +65,11 @@ const CONTENT_TYPES = ['video', 'image', 'carousel', 'story', 'reel', 'ugc'] as 
 
 // Convert 12-hour to 24-hour format
 const to24Hour = (hour: string, period: "AM" | "PM"): number => {
-  let h = parseInt(hour, 10);
+  const h = parseInt(hour, 10);
   if (period === "AM") {
     return h === 12 ? 0 : h;
-  } else {
-    return h === 12 ? 12 : h + 12;
   }
+  return h === 12 ? 12 : h + 12;
 };
 
 type PlatformOption = { id: string; label: string; icon: string };
@@ -169,7 +168,9 @@ export function AddContentDialog({
     try {
       JSON.parse(mediaUrl); // If it parses as JSON array, skip auto-detect
       return;
-    } catch {}
+    } catch {
+      // not JSON — continue with extension-based detection below
+    }
     const url = mediaUrl.toLowerCase();
     const urlWithoutParams = url.split('?')[0];
     
