@@ -47,16 +47,18 @@ jobs:
 
       # Type-checks every edge function. Each function is self-contained
       # (Deno entry point) so we type-check them individually.
+      # --node-modules-dir=auto is required because Stripe (and a few esm.sh
+      # shims) pull in @types/node, which Deno 2 needs node_modules to resolve.
       - name: Type-check edge functions
         run: |
           set -e
           for fn in supabase/functions/*/index.ts; do
             echo "::group::Type-check $fn"
-            deno check --allow-import "$fn"
+            deno check --allow-import --node-modules-dir=auto "$fn"
             echo "::endgroup::"
           done
 
       # Smoke tests for the shared library. Adds confidence that
       # shared changes don't quietly break every function.
       - name: Run shared lib tests
-        run: deno test --allow-net --allow-env supabase/functions/_shared/__tests__/
+        run: deno test --allow-net --allow-env --node-modules-dir=auto supabase/functions/_shared/__tests__/
