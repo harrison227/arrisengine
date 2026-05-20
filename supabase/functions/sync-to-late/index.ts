@@ -176,7 +176,7 @@ Deno.serve(withErrorHandling({ fn: 'sync-to-late' }, async ({ req, log }) => {
     .filter((p): p is PlatformTarget => p !== null);
 
   const lateStoryPlatforms: PlatformTarget[] = storyPlatforms
-    .map((platformKey) => {
+    .map<PlatformTarget | null>((platformKey) => {
       const basePlatform = platformKey.replace('_stories', '');
       const mappedPlatform = mapPlatform(basePlatform);
       const accountId = accountMap.get(platformKey) ?? accountMap.get(basePlatform);
