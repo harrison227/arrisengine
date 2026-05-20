@@ -58,15 +58,18 @@ export async function uploadToR2(
     const encoder = new TextEncoder();
 
     async function hmacSHA256(key: ArrayBuffer | Uint8Array, message: string): Promise<ArrayBuffer> {
+      // Cast to BufferSource — TS 5.7's stricter typing distinguishes
+      // SharedArrayBuffer from ArrayBuffer; we know our buffer is the latter.
+      const keyData = (key instanceof Uint8Array ? key : new Uint8Array(key)) as BufferSource;
       const cryptoKey = await crypto.subtle.importKey(
-        'raw', key instanceof Uint8Array ? key : new Uint8Array(key),
+        'raw', keyData,
         { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
       );
       return crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(message));
     }
 
     async function sha256(data: Uint8Array): Promise<string> {
-      const hash = await crypto.subtle.digest('SHA-256', data);
+      const hash = await crypto.subtle.digest('SHA-256', data as BufferSource);
       return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
