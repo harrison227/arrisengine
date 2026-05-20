@@ -192,8 +192,11 @@ Deno.serve(withErrorHandling({ fn: 'sync-text-to-late' }, async ({ req, log }) =
     throw new Error('Could not determine Late post id from Late response');
   }
 
-  const baseUpdate = supabase.from('text_posts').update({ late_post_id: latePostId }).eq('id', textPostId).select('id');
-  let updateResult = lockValue ? await baseUpdate.eq('late_post_id', lockValue) : await baseUpdate;
+  // Build the update chain with all filters applied before .select() — Supabase
+  // 2.57.2's typings won't let you add .eq() onto a TransformBuilder (post-select).
+  let updateResult = lockValue
+    ? await supabase.from('text_posts').update({ late_post_id: latePostId }).eq('id', textPostId).eq('late_post_id', lockValue).select('id')
+    : await supabase.from('text_posts').update({ late_post_id: latePostId }).eq('id', textPostId).select('id');
   if (lockValue && (!updateResult.data || updateResult.data.length === 0) && !updateResult.error) {
     log.warn('lock_lost_during_persist', { textPostId });
     updateResult = await supabase.from('text_posts').update({ late_post_id: latePostId }).eq('id', textPostId).select('id');
