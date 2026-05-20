@@ -97,15 +97,10 @@ export function useClientLogos(clientId: string | undefined) {
   const setPrimaryMutation = useMutation({
     mutationFn: async (logoId: string) => {
       if (!clientId) throw new Error('clientId required');
-      // Clear any existing primary first (the unique partial index would block us otherwise).
-      const { error: clearError } = await (supabase.from as any)(LOGO_TABLE)
-        .update({ is_primary: false })
-        .eq('client_id', clientId)
-        .eq('is_primary', true);
-      if (clearError) throw clearError;
-      const { error } = await (supabase.from as any)(LOGO_TABLE)
-        .update({ is_primary: true })
-        .eq('id', logoId);
+      // Atomic swap via SECURITY DEFINER RPC. Replaces the previous two-query
+      // client-side swap, which could leave a client with no primary if the
+      // second query failed.
+      const { error } = await (supabase.rpc as any)('set_client_primary_logo', { p_logo_id: logoId });
       if (error) throw error;
     },
     onSuccess: () => {

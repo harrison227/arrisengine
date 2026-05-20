@@ -98,7 +98,10 @@ export default function PublicBrandPack() {
 
   return (
     <div className="min-h-screen bg-background">
-      <header className="border-b border-border" style={{ borderTopColor: accent, borderTopWidth: 4 }}>
+      <header
+        className="border-b border-border border-t-4"
+        style={{ borderTopColor: accent, borderTopStyle: 'solid' }}
+      >
         <div className="max-w-5xl mx-auto px-6 sm:px-10 py-8 flex flex-wrap items-end justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-widest text-muted-foreground">Brand pack</p>

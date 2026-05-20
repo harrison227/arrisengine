@@ -143,6 +143,20 @@ Deno.serve(withErrorHandling({ fn: 'generate-batch-image' }, async ({ req, log }
     .eq('client_id', clientId)
     .order('role', { ascending: true });
 
+  // Brand Pack primary logo (if present) takes precedence over the legacy
+  // single brand_logo_url on clients. Only used when no caller-supplied
+  // brandLogoUrl is given.
+  let effectiveBrandLogoUrl = brandLogoUrl ?? null;
+  if (!effectiveBrandLogoUrl) {
+    const { data: primaryLogo } = await supabase
+      .from('client_logos')
+      .select('file_url')
+      .eq('client_id', clientId)
+      .eq('is_primary', true)
+      .maybeSingle();
+    effectiveBrandLogoUrl = primaryLogo?.file_url ?? (client.brand_logo_url as string | null) ?? null;
+  }
+
   // Collect reference images from all sources.
   let allReferenceImages: string[] = referenceImages ? [...referenceImages] : [];
   if (referenceImageUrl) allReferenceImages.push(referenceImageUrl);
@@ -249,7 +263,7 @@ ${feedback ? `FEEDBACK TO ADDRESS: ${feedback}` : ''}
 ${isRegeneration && hasReferenceImages ? `
 REGENERATION MODE: The first reference image is the previous version. REFINE it based on feedback - keep composition and style, just improve based on notes.` : ''}
 
-${brandLogoUrl ? `
+${effectiveBrandLogoUrl ? `
 LOGO: Include the provided brand logo. ${getLogoPlacementInstructions(logoPlacement)}` : ''}
 
 OUTPUT: 4:5 portrait (1080x1350), ultra-sharp, magazine-quality, brand colors must be PROMINENT.`;
@@ -322,9 +336,9 @@ OUTPUT: 4:5 portrait (1080x1350), ultra-sharp, magazine-quality, brand colors mu
     // nano-banana / nano-banana-2 — same Google Gemini image preview model.
     const geminiModel = 'gemini-3.1-flash-image-preview';
     const parts: Array<Record<string, unknown>> = [{ text: prompt }];
-    if (brandLogoUrl) {
+    if (effectiveBrandLogoUrl) {
       try {
-        const { data, mimeType } = await fetchAsBase64(brandLogoUrl);
+        const { data, mimeType } = await fetchAsBase64(effectiveBrandLogoUrl);
         parts.push({ inlineData: { mimeType, data } });
       } catch (err) {
         log.warn('logo_fetch_failed', { error: err instanceof Error ? err.message : String(err) });

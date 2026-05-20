@@ -64,35 +64,34 @@ COMMENT ON TABLE public.rate_limit_buckets IS
 -- Drop the overly permissive policy from 20251230063845.
 DROP POLICY IF EXISTS "Anyone can update feedback_submitted_at" ON public.plan_share_links;
 
--- New, tightly-scoped SECURITY DEFINER function for the public planner UI.
--- The public-content-action / public-plan-feedback edge function calls this
--- via service role, so it always runs; the function itself enforces the
--- "only mutate feedback_submitted_at on an active link" invariant.
-CREATE OR REPLACE FUNCTION public.record_plan_share_feedback_submitted(p_share_id TEXT)
-RETURNS BOOLEAN
+-- Replace the policy with a trigger that auto-stamps feedback_submitted_at
+-- whenever a row is inserted into plan_feedback. Triggers run as the table
+-- owner (postgres), bypassing RLS — so anonymous feedback submissions can
+-- still stamp the parent share link without needing a broad UPDATE grant.
+CREATE OR REPLACE FUNCTION public.stamp_plan_share_feedback_submitted()
+RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
-DECLARE
-  v_updated INT;
 BEGIN
   UPDATE public.plan_share_links
   SET feedback_submitted_at = now()
-  WHERE share_id = p_share_id
+  WHERE id = NEW.share_link_id
     AND is_active = true
     AND (expires_at IS NULL OR expires_at > now());
-
-  GET DIAGNOSTICS v_updated = ROW_COUNT;
-  RETURN v_updated > 0;
+  RETURN NEW;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.record_plan_share_feedback_submitted(TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.record_plan_share_feedback_submitted(TEXT) TO authenticated, anon, service_role;
+DROP TRIGGER IF EXISTS trg_plan_feedback_stamp_share_link ON public.plan_feedback;
+CREATE TRIGGER trg_plan_feedback_stamp_share_link
+  AFTER INSERT ON public.plan_feedback
+  FOR EACH ROW
+  EXECUTE FUNCTION public.stamp_plan_share_feedback_submitted();
 
-COMMENT ON FUNCTION public.record_plan_share_feedback_submitted IS
-  'Stamps feedback_submitted_at on an active plan share link. Replaces the deprecated permissive UPDATE policy.';
+COMMENT ON FUNCTION public.stamp_plan_share_feedback_submitted IS
+  'After-insert trigger fn for plan_feedback. Stamps feedback_submitted_at on the parent share link in one atomic step, replacing the dropped "Anyone can update feedback_submitted_at" RLS policy.';
 
 
 -- Hot-path indexes -----------------------------------------------------------

@@ -100,8 +100,21 @@ Deno.serve(withErrorHandling({ fn: 'generate-social-image' }, async ({ req, log 
   const { data: client } = await supabase.from('clients').select('*').eq('id', clientId).maybeSingle();
   if (!client) throw notFound('Client not found');
 
+  // Brand Pack primary logo wins over the legacy single brand_logo_url, but
+  // only if the caller didn't supply one explicitly.
+  let effectiveBrandLogoUrl: string | null = brandLogoUrl ?? null;
+  if (!effectiveBrandLogoUrl) {
+    const { data: primaryLogo } = await supabase
+      .from('client_logos')
+      .select('file_url')
+      .eq('client_id', clientId)
+      .eq('is_primary', true)
+      .maybeSingle();
+    effectiveBrandLogoUrl = primaryLogo?.file_url ?? (client.brand_logo_url as string | null) ?? null;
+  }
+
   let allReferenceImages: string[] = [...referenceImages];
-  if (brandLogoUrl) allReferenceImages.unshift(brandLogoUrl);
+  if (effectiveBrandLogoUrl) allReferenceImages.unshift(effectiveBrandLogoUrl);
   if (savedReferenceImageIds && savedReferenceImageIds.length > 0) {
     const { data: savedImages } = await supabase.from('client_reference_images').select('thumbnail_url').in('id', savedReferenceImageIds);
     if (savedImages) {
@@ -172,7 +185,7 @@ Style Requirements:
 - Optimized for square (1:1) format
 - No placeholder text - use the actual content provided`;
 
-  if (brandLogoUrl) {
+  if (effectiveBrandLogoUrl) {
     const placementText = PLACEMENT_MAP[logoPlacement ?? 'auto'] ?? 'a subtle position';
     imagePrompt += `\n\nIMPORTANT - BRAND LOGO: A brand logo image has been provided as one of the reference images. You MUST incorporate this logo into the design, placed in ${placementText}. The logo should be clearly visible but not overwhelm the main content.`;
   }

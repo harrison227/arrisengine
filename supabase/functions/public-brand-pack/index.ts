@@ -10,10 +10,11 @@
  */
 
 import { withErrorHandling, jsonResponse, parseJsonBody } from '../_shared/http.ts';
-import { notFound } from '../_shared/errors.ts';
+import { notFound, rateLimited } from '../_shared/errors.ts';
 import { ensureNonEmptyString } from '../_shared/validation.ts';
 import { getSupabaseAdmin } from '../_shared/supabase.ts';
 import { getBrandShareLink } from '../_shared/share-links.ts';
+import { checkRateLimit } from '../_shared/rate-limit.ts';
 
 interface RequestBody { shareId: unknown }
 
@@ -22,6 +23,12 @@ Deno.serve(withErrorHandling({ fn: 'public-brand-pack' }, async ({ req, log }) =
   const shareId = ensureNonEmptyString('shareId', rawShareId, 200);
 
   const supabase = getSupabaseAdmin();
+
+  // Rate limit per share-id. Generous — the page is small and assets are
+  // CDN-cached — but prevents a runaway script from spamming the endpoint.
+  const rl = await checkRateLimit({ bucket: 'public-brand-pack', subject: shareId, windowSec: 60, max: 120, supabase });
+  if (!rl.allowed) throw rateLimited(`Too many requests. Please wait ${rl.waitTime} seconds.`, rl.waitTime);
+
   const shareLink = await getBrandShareLink(supabase, shareId);
 
   // Read everything needed for the brand pack page.

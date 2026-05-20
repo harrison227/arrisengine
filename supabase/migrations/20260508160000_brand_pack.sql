@@ -256,6 +256,52 @@ GRANT EXECUTE ON FUNCTION public.record_brand_pack_download(TEXT) TO authenticat
 
 
 -- ============================================================================
+-- ATOMIC set-primary-logo helper
+-- ============================================================================
+-- Without this, a two-statement client-side swap (clear all primaries, then
+-- mark new one) can leave a client with zero primaries if the second
+-- statement fails. The function does both in one transaction and respects
+-- the unique partial index `uq_client_logos_primary`.
+CREATE OR REPLACE FUNCTION public.set_client_primary_logo(p_logo_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_client_id UUID;
+  v_caller UUID;
+BEGIN
+  v_caller := auth.uid();
+  IF v_caller IS NULL THEN
+    RAISE EXCEPTION 'Authentication required';
+  END IF;
+
+  SELECT client_id INTO v_client_id FROM public.client_logos WHERE id = p_logo_id;
+  IF v_client_id IS NULL THEN
+    RAISE EXCEPTION 'Logo not found';
+  END IF;
+
+  -- RLS-equivalent access check.
+  IF NOT (public.is_admin_or_owner(v_caller) OR public.has_client_access(v_caller, v_client_id)) THEN
+    RAISE EXCEPTION 'You do not have access to this client';
+  END IF;
+
+  -- Atomic swap: clear existing primary, set new one.
+  UPDATE public.client_logos SET is_primary = false WHERE client_id = v_client_id AND is_primary = true;
+  UPDATE public.client_logos SET is_primary = true  WHERE id = p_logo_id;
+  RETURN true;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.set_client_primary_logo(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.set_client_primary_logo(UUID) TO authenticated, service_role;
+
+COMMENT ON FUNCTION public.set_client_primary_logo IS
+  'Atomically marks one logo as primary for its client, clearing any prior primary in the same transaction.';
+
+
+-- ============================================================================
 -- STORAGE BUCKET — for logo + font file uploads
 -- ============================================================================
 -- We piggy-back on the existing client-assets bucket (already public + RLS-policed).
